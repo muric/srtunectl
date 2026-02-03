@@ -58,11 +58,14 @@ type Stats struct {
 	NoRouteToHost      int64
 	UnknownError       int64
 
-	dupChan        chan string
-	writerDone     chan struct{}
+	dupChan     chan string
+	writerDone  chan struct{}
 	duplicatesFile *os.File
-	filename       string
-	closeOnce      sync.Once
+	filename    string
+	closeOnce   sync.Once
+
+	// count of duplicates that could not be enqueued due to a full channel
+	DupDropped int64
 }
 
 func NewStats() *Stats {
@@ -85,11 +88,16 @@ func (s *Stats) duplicatesWriter() {
 		}
 
 		if s.duplicatesFile == nil {
-			file, err := os.Create(s.filename)
+			// Use CreateTemp to avoid predictable filename issues
+			file, err := os.CreateTemp(filepath.Dir(s.filename), filepath.Base(s.filename)+"_*")
 			if err != nil {
-				log.Printf("Error creating duplicates file: %v\n", err)
-				buffer = buffer[:0]
-				return
+				// fallback to Create with original filename
+				file, err = os.Create(s.filename)
+				if err != nil {
+					log.Printf("Error creating duplicates file: %v\n", err)
+					buffer = buffer[:0]
+					return
+				}
 			}
 			s.duplicatesFile = file
 		}
@@ -122,7 +130,7 @@ func (s *Stats) duplicatesWriter() {
 		if err := s.duplicatesFile.Close(); err != nil {
 			log.Printf("Error closing duplicates file: %v", err)
 		}
-		log.Printf("Duplicates written to: %s", s.filename)
+		log.Printf("Duplicates written to: %s", s.duplicatesFile.Name())
 	}
 
 	close(s.writerDone)
@@ -134,7 +142,12 @@ func (s *Stats) AddSuccess() {
 
 func (s *Stats) AddAlreadyExist(route string) {
 	atomic.AddInt64(&s.AlreadyExist, 1)
-	s.dupChan <- route
+	// Non-blocking send to avoid blocking worker goroutines if writer lags
+	select {
+	case s.dupChan <- route:
+	default:
+		atomic.AddInt64(&s.DupDropped, 1)
+	}
 }
 
 func (s *Stats) AddError(errType string) {
@@ -149,6 +162,9 @@ func (s *Stats) AddError(errType string) {
 		atomic.AddInt64(&s.NoRouteToHost, 1)
 	case "unknown":
 		atomic.AddInt64(&s.UnknownError, 1)
+	case "no_such_device":
+		// treat as unknown for counting purposes if desired
+		atomic.AddInt64(&s.UnknownError, 1)
 	}
 }
 
@@ -160,6 +176,7 @@ func (s *Stats) PrintStats() {
 	invalidArgument := atomic.LoadInt64(&s.InvalidArgument)
 	noRouteToHost := atomic.LoadInt64(&s.NoRouteToHost)
 	unknownError := atomic.LoadInt64(&s.UnknownError)
+	dropped := atomic.LoadInt64(&s.DupDropped)
 
 	var sb strings.Builder
 	sb.WriteString("\n========== Statistics ==========\n")
@@ -181,6 +198,9 @@ func (s *Stats) PrintStats() {
 	if unknownError > 0 {
 		fmt.Fprintf(&sb, "Unknown errors: %d\n", unknownError)
 	}
+	if dropped > 0 {
+		fmt.Fprintf(&sb, "Duplicate entries dropped (writer lag): %d\n", dropped)
+	}
 
 	totalErrors := alreadyExist + networkUnreachable + operationNotPermit + invalidArgument + noRouteToHost + unknownError
 	fmt.Fprintf(&sb, "Total processed: %d\n", success+totalErrors)
@@ -197,9 +217,12 @@ func (s *Stats) Close() {
 }
 
 func classifyError(err error) string {
+	if err == nil {
+		return "unknown"
+	}
 	errStr := err.Error()
 
-	if strings.Contains(errStr, "file exists") {
+	if strings.Contains(errStr, "file exists") || strings.Contains(errStr, "File exists") {
 		return "file_exists"
 	}
 	if strings.Contains(errStr, "network is unreachable") {
@@ -216,6 +239,23 @@ func classifyError(err error) string {
 	}
 	if strings.Contains(errStr, "no route to host") {
 		return "no_route_to_host"
+	}
+
+	// try to unwrap syscall.Errno if possible
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EEXIST:
+			return "file_exists"
+		case syscall.ENETUNREACH:
+			return "network_unreachable"
+		case syscall.EPERM:
+			return "operation_not_permitted"
+		case syscall.EINVAL:
+			return "invalid_argument"
+		case syscall.EHOSTUNREACH:
+			return "no_route_to_host"
+		}
 	}
 
 	return "unknown"
@@ -314,28 +354,45 @@ func createTunInterface(ifName string) error {
 func setIpTunInterface(ifName, gateway string) error {
 	link, err := netlink.LinkByName(ifName)
 	if err != nil {
-		log.Fatalf("interface not found: %v", err)
+		return fmt.Errorf("interface not found: %w", err)
 	}
 
-	addr, err := netlink.ParseAddr(gateway + "/24")
-	if err != nil {
-		log.Fatalf("Failed to parse ip: %v", err)
+	// Accept both plain IP and CIDR; if plain IP -> use /24 for IPv4 (legacy behavior) or /128 for IPv6
+	var addr *netlink.Addr
+	if strings.Contains(gateway, "/") {
+		a, err := netlink.ParseAddr(gateway)
+		if err != nil {
+			return fmt.Errorf("failed to parse ip: %w", err)
+		}
+		addr = a
+	} else {
+		ip := net.ParseIP(gateway)
+		if ip == nil {
+			return fmt.Errorf("failed to parse ip: %s", gateway)
+		}
+		var mask net.IPMask
+		if ip.To4() == nil {
+			mask = net.CIDRMask(128, 128)
+		} else {
+			mask = net.CIDRMask(24, 32)
+		}
+		a := &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: mask}}
+		addr = a
 	}
 
 	err = netlink.AddrAdd(link, addr)
 	if err != nil {
 		if errors.Is(err, syscall.EEXIST) {
-			log.Printf("IP %s are allready setuped on interface %s ", addr.IP, link.Attrs().Name)
+			log.Printf("IP %s already set up on interface %s", addr.IP, link.Attrs().Name)
 		} else {
-			log.Fatalf("failed to set up ip: %v", err)
+			return fmt.Errorf("failed to set up ip: %w", err)
 		}
 	}
 
-	err = netlink.LinkSetUp(link)
-	if err != nil {
-		log.Fatalf("Failed to up interface: %v", err)
+	if err := netlink.LinkSetUp(link); err != nil {
+		return fmt.Errorf("failed to bring up interface: %w", err)
 	}
-	return err
+	return nil
 }
 
 func addRoute(destination string, gwIP net.IP, ifaceIndex int) error {
@@ -346,7 +403,12 @@ func addRoute(destination string, gwIP net.IP, ifaceIndex int) error {
 		if ip == nil {
 			return fmt.Errorf("error parsing destination %s: %w", destination, err)
 		}
-		ipNet = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+		// choose mask based on IP family
+		if ip.To4() == nil {
+			ipNet = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+		} else {
+			ipNet = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+		}
 	} else {
 		ipNet = parsedNet
 	}
@@ -381,7 +443,13 @@ func addRoutesFromDir(dir, gateway, ifaceName string, goroutineCount int, debug 
 	ifaceIndex := iface.Attrs().Index
 	gwIP := net.ParseIP(gateway)
 	if gwIP == nil {
-		return fmt.Errorf("invalid gateway IP: %s", gateway)
+		// try parse as CIDR and extract IP
+		if ipStr := strings.SplitN(gateway, "/", 2)[0]; ipStr != "" {
+			gwIP = net.ParseIP(ipStr)
+		}
+		if gwIP == nil {
+			return fmt.Errorf("invalid gateway IP: %s", gateway)
+		}
 	}
 
 	var jsonFiles []string
@@ -391,7 +459,8 @@ func addRoutesFromDir(dir, gateway, ifaceName string, goroutineCount int, debug 
 			return err
 		}
 		if !info.IsDir() && filepath.Ext(path) == ".json" {
-			jsonFiles = append(jsonFiles, info.Name())
+			// store full path (was a bug: stored only info.Name())
+			jsonFiles = append(jsonFiles, path)
 		}
 		return nil
 	})
@@ -404,17 +473,17 @@ func addRoutesFromDir(dir, gateway, ifaceName string, goroutineCount int, debug 
 		return nil
 	}
 
-	for _, fileName := range jsonFiles {
-		log.Println("Processing:", fileName)
-		data, err := os.ReadFile(filepath.Join(dir, fileName))
+	for _, filePath := range jsonFiles {
+		log.Println("Processing:", filePath)
+		data, err := os.ReadFile(filePath)
 		if err != nil {
-			log.Printf("\033[31mError reading file %s: %v\033[0m\n", fileName, err)
+			log.Printf("\033[31mError reading file %s: %v\033[0m\n", filePath, err)
 			continue
 		}
 
 		var destinations []string
 		if err := json.Unmarshal(data, &destinations); err != nil {
-			log.Printf("\033[31mError parsing JSON %s: %v\033[0m\n", fileName, err)
+			log.Printf("\033[31mError parsing JSON %s: %v\033[0m\n", filePath, err)
 			continue
 		}
 
@@ -456,17 +525,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("\033[31mError reading configuration: %v\033[0m", err)
 	}
+
 	// create tun interface from config
-	log.Println("create tun interface from config")
-	err = createTunInterface(config.Interface)
-	if err != nil {
-		log.Fatalf("System error ioctl: %v", err)
-	}
-	//set tun interface ip
-	log.Println("set gateway ip to tun interface")
-	err = setIpTunInterface(config.Interface, config.Gateway)
-	if err != nil {
-		log.Fatalf("System error ioctl: %v", err)
+	if config.Interface != "" {
+		log.Println("create tun interface from config")
+		if err := createTunInterface(config.Interface); err != nil {
+			log.Fatalf("System error ioctl: %v", err)
+		}
+		// set tun interface ip
+		if config.Gateway != "" {
+			log.Println("set gateway ip to tun interface")
+			if err := setIpTunInterface(config.Interface, config.Gateway); err != nil {
+				log.Fatalf("System error setting IP: %v", err)
+			}
+		}
 	}
 
 	stats := NewStats()
