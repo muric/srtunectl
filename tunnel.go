@@ -67,9 +67,12 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
-	// Set up UDP forwarder — handles all incoming UDP packets
-	udpForwarder := udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
+	// Set up UDP forwarder — handles all incoming UDP packets.
+	// Handler returns true to indicate the request was handled (prevents
+	// netstack from sending ICMP port unreachable for proxied packets).
+	udpForwarder := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		go t.handleUDP(r)
+		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
 

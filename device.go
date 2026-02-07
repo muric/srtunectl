@@ -204,6 +204,14 @@ func (e *TUNEndpoint) dispatchLoop() {
 			}
 		}
 
+		// Intercept ICMP echo requests and reply instantly.
+		// SS protocol cannot proxy ICMP, so we generate local replies.
+		// This gives <1ms ping for TUN-routed IPs — a quick diagnostic
+		// that the route goes through the tunnel.
+		if e.handleICMPEcho(pktData, proto) {
+			continue
+		}
+
 		// Create a PacketBuffer and deliver to netstack
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(pktData),
@@ -217,5 +225,159 @@ func (e *TUNEndpoint) dispatchLoop() {
 // Currently WritePackets handles writes directly.
 func (e *TUNEndpoint) writeLoop() {
 	// No-op: writes are handled synchronously in WritePackets
+}
+
+// handleICMPEcho intercepts ICMP echo requests and writes an instant echo
+// reply back to the TUN device. Returns true if the packet was handled.
+func (e *TUNEndpoint) handleICMPEcho(pkt []byte, proto tcpip.NetworkProtocolNumber) bool {
+	switch proto {
+	case header.IPv4ProtocolNumber:
+		return e.handleICMPv4Echo(pkt)
+	case header.IPv6ProtocolNumber:
+		return e.handleICMPv6Echo(pkt)
+	default:
+		return false
+	}
+}
+
+// handleICMPv4Echo handles IPv4 ICMP echo request → echo reply.
+func (e *TUNEndpoint) handleICMPv4Echo(pkt []byte) bool {
+	// IPv4 header: minimum 20 bytes, ICMP header: 8 bytes
+	if len(pkt) < 28 {
+		return false
+	}
+
+	ihl := int(pkt[0]&0x0f) * 4
+	if ihl < 20 || len(pkt) < ihl+8 {
+		return false
+	}
+
+	// Check IP protocol field == ICMP (1)
+	if pkt[9] != 1 {
+		return false
+	}
+
+	// Check ICMP type == echo request (8)
+	icmp := ihl
+	if pkt[icmp] != 8 {
+		return false
+	}
+
+	// Build reply: copy entire packet, swap addresses, change type
+	reply := make([]byte, len(pkt))
+	copy(reply, pkt)
+
+	// Swap src ↔ dst IP (offsets 12..15 and 16..19)
+	copy(reply[12:16], pkt[16:20])
+	copy(reply[16:20], pkt[12:16])
+
+	// Recalculate IPv4 header checksum
+	reply[10] = 0
+	reply[11] = 0
+	ipCsum := ipChecksum(reply[:ihl])
+	reply[10] = byte(ipCsum >> 8)
+	reply[11] = byte(ipCsum)
+
+	// Set ICMP type to echo reply (0)
+	reply[icmp] = 0
+
+	// Recalculate ICMP checksum
+	reply[icmp+2] = 0
+	reply[icmp+3] = 0
+	icmpCsum := ipChecksum(reply[icmp:])
+	reply[icmp+2] = byte(icmpCsum >> 8)
+	reply[icmp+3] = byte(icmpCsum)
+
+	syscall.Write(e.tunDev.fd, reply)
+	return true
+}
+
+// handleICMPv6Echo handles ICMPv6 echo request → echo reply.
+func (e *TUNEndpoint) handleICMPv6Echo(pkt []byte) bool {
+	// IPv6 header: 40 bytes, ICMPv6 header: 8 bytes minimum
+	if len(pkt) < 48 {
+		return false
+	}
+
+	// Check Next Header == ICMPv6 (58)
+	if pkt[6] != 58 {
+		return false
+	}
+
+	// Check ICMPv6 type == echo request (128)
+	icmp := 40
+	if pkt[icmp] != 128 {
+		return false
+	}
+
+	// Build reply
+	reply := make([]byte, len(pkt))
+	copy(reply, pkt)
+
+	// Swap src ↔ dst IPv6 addresses (offsets 8..23 and 24..39)
+	copy(reply[8:24], pkt[24:40])
+	copy(reply[24:40], pkt[8:24])
+
+	// Set ICMPv6 type to echo reply (129)
+	reply[icmp] = 129
+
+	// Recalculate ICMPv6 checksum (includes pseudo-header)
+	reply[icmp+2] = 0
+	reply[icmp+3] = 0
+	icmpPayload := reply[icmp:]
+	csum := icmpv6Checksum(reply[8:24], reply[24:40], icmpPayload)
+	reply[icmp+2] = byte(csum >> 8)
+	reply[icmp+3] = byte(csum)
+
+	syscall.Write(e.tunDev.fd, reply)
+	return true
+}
+
+// ipChecksum computes the Internet checksum (RFC 1071).
+func ipChecksum(data []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(data)-1; i += 2 {
+		sum += uint32(data[i])<<8 | uint32(data[i+1])
+	}
+	if len(data)%2 == 1 {
+		sum += uint32(data[len(data)-1]) << 8
+	}
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
+}
+
+// icmpv6Checksum computes the ICMPv6 checksum with pseudo-header.
+func icmpv6Checksum(srcIP, dstIP, icmpData []byte) uint16 {
+	var sum uint32
+
+	// Pseudo-header: src address
+	for i := 0; i < len(srcIP)-1; i += 2 {
+		sum += uint32(srcIP[i])<<8 | uint32(srcIP[i+1])
+	}
+	// Pseudo-header: dst address
+	for i := 0; i < len(dstIP)-1; i += 2 {
+		sum += uint32(dstIP[i])<<8 | uint32(dstIP[i+1])
+	}
+	// Pseudo-header: payload length (32-bit, big-endian)
+	plen := uint32(len(icmpData))
+	sum += plen >> 16
+	sum += plen & 0xffff
+	// Pseudo-header: next header (58 = ICMPv6)
+	sum += 58
+
+	// ICMPv6 data
+	for i := 0; i < len(icmpData)-1; i += 2 {
+		sum += uint32(icmpData[i])<<8 | uint32(icmpData[i+1])
+	}
+	if len(icmpData)%2 == 1 {
+		sum += uint32(icmpData[len(icmpData)-1]) << 8
+	}
+
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
 }
 
