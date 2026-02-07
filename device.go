@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -78,6 +79,7 @@ type TUNEndpoint struct {
 	mtu        uint32
 	dispatcher stack.NetworkDispatcher
 	done       chan struct{}
+	closeOnce  sync.Once
 }
 
 // NewTUNEndpoint creates a new TUNEndpoint wrapping a TUN device.
@@ -151,8 +153,14 @@ func (e *TUNEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Erro
 	for _, pkt := range pkts.AsSlice() {
 		data := pkt.ToView().AsSlice()
 		if _, err := syscall.Write(e.tunDev.fd, data); err != nil {
-			log.Printf("Error writing to TUN: %v", err)
-			return n, &tcpip.ErrAborted{}
+			// Suppress errors during shutdown (fd already closed)
+			select {
+			case <-e.done:
+				return n, &tcpip.ErrAborted{}
+			default:
+				log.Printf("Error writing to TUN: %v", err)
+				return n, &tcpip.ErrAborted{}
+			}
 		}
 		n++
 	}
@@ -166,9 +174,12 @@ func (e *TUNEndpoint) Wait() {}
 func (e *TUNEndpoint) SetOnCloseAction(func()) {}
 
 // Close stops the dispatch loop and closes the TUN device.
+// Safe to call multiple times (gVisor stack may call it during shutdown).
 func (e *TUNEndpoint) Close() {
-	close(e.done)
-	_ = e.tunDev.Close()
+	e.closeOnce.Do(func() {
+		close(e.done)
+		_ = e.tunDev.Close()
+	})
 }
 
 // dispatchLoop reads raw IP packets from the TUN device and delivers

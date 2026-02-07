@@ -190,10 +190,12 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 }
 
 // Close shuts down the tunnel and releases resources.
+// Order: close stack first (drains connections), then endpoint (closes TUN fd).
+// stack.Wait() may call endpoint.Close() again — safe due to closeOnce.
 func (t *Tunnel) Close() {
-	t.endpoint.Close()
 	t.stack.Close()
 	t.stack.Wait()
+	t.endpoint.Close()
 }
 
 // pipe copies data bidirectionally between two connections.
