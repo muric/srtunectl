@@ -12,6 +12,7 @@ all: build
 # Build target
 build:
 	@echo "Building the application..."
+	go mod tidy
 	go build -o ./output/${APP_NAME} .
 
 # Clean target
