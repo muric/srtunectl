@@ -12,7 +12,7 @@ all: build
 # Build target
 build:
 	@echo "Building the application..."
-	go build -o ./output/${APP_NAME} main.go
+	go build -o ./output/${APP_NAME} .
 
 # Clean target
 clean:
