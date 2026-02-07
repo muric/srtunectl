@@ -9,10 +9,12 @@ IPROUTE_GIT_DIR := $(shell pwd)
 # Default target
 all: build
 
-# Build target
-build:
-	@echo "Building the application..."
+tidy:
 	go mod tidy
+
+# Build target
+build: tidy
+	@echo "Building the application..."
 	go build -o ./output/${APP_NAME} .
 
 # Clean target
