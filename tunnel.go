@@ -68,10 +68,18 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
 	// Set up UDP forwarder — handles all incoming UDP packets.
-	// Handler returns true to indicate the request was handled (prevents
-	// netstack from sending ICMP port unreachable for proxied packets).
+	// CreateEndpoint is called synchronously to register the endpoint
+	// before returning. This prevents "port is in use" race conditions
+	// when multiple packets for the same flow arrive rapidly (e.g. QUIC).
+	// The relay goroutine is spawned only after the endpoint is registered.
 	udpForwarder := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
-		go t.handleUDP(r)
+		var wq waiter.Queue
+		ep, err := r.CreateEndpoint(&wq)
+		if err != nil {
+			// Endpoint already exists — packet handled by existing session
+			return true
+		}
+		go t.relayUDP(r.ID(), &wq, ep)
 		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
@@ -133,7 +141,7 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 	r.Complete(false)
 
 	localConn := gonet.NewTCPConn(&wq, ep)
-	defer localConn.Close()
+	defer func() { _ = localConn.Close() }()
 
 	// Dial through SS proxy
 	ctx, cancel := context.WithTimeout(context.Background(), tcpConnectTimeout)
@@ -144,7 +152,7 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 		log.Printf("[TCP] %s <-> %s: dial failed: %v", srcAddr, dstAddr, err)
 		return
 	}
-	defer remoteConn.Close()
+	defer func() { _ = remoteConn.Close() }()
 
 	log.Printf("[TCP] %s <-> %s", srcAddr, dstAddr)
 
@@ -152,22 +160,14 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 	pipe(localConn, remoteConn)
 }
 
-// handleUDP handles a new UDP packet from the netstack.
-// It creates a UDP relay through the SS proxy.
-func (t *Tunnel) handleUDP(r *udp.ForwarderRequest) {
-	id := r.ID()
+// relayUDP relays a UDP session through the SS proxy.
+// The endpoint is already created and registered by the forwarder handler.
+func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcpip.Endpoint) {
 	srcAddr := fmt.Sprintf("%s:%d", id.RemoteAddress.String(), id.RemotePort)
 	dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
 
-	var wq waiter.Queue
-	ep, tcpErr := r.CreateEndpoint(&wq)
-	if tcpErr != nil {
-		log.Printf("[UDP] failed to create endpoint for %s: %v", dstAddr, tcpErr)
-		return
-	}
-
-	localConn := gonet.NewUDPConn(&wq, ep)
-	defer localConn.Close()
+	localConn := gonet.NewUDPConn(wq, ep)
+	defer func() { _ = localConn.Close() }()
 
 	// Dial UDP through SS proxy
 	remotePC, err := t.proxy.DialUDP()
@@ -175,7 +175,7 @@ func (t *Tunnel) handleUDP(r *udp.ForwarderRequest) {
 		log.Printf("[UDP] %s <-> %s: dial failed: %v", srcAddr, dstAddr, err)
 		return
 	}
-	defer remotePC.Close()
+	defer func() { _ = remotePC.Close() }()
 
 	remote, err := net.ResolveUDPAddr("udp", dstAddr)
 	if err != nil {
@@ -204,21 +204,21 @@ func pipe(a, b net.Conn) {
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, relayBufferSize)
-		io.CopyBuffer(b, a, buf)
+		_, _ = io.CopyBuffer(b, a, buf)
 		if tc, ok := b.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		}
-		b.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
+		_ = b.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
 	}()
 
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, relayBufferSize)
-		io.CopyBuffer(a, b, buf)
+		_, _ = io.CopyBuffer(a, b, buf)
 		if tc, ok := a.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		}
-		a.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
+		_ = a.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
 	}()
 
 	wg.Wait()
@@ -234,7 +234,7 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration
 		defer wg.Done()
 		buf := make([]byte, 65535)
 		for {
-			local.SetReadDeadline(time.Now().Add(timeout))
+			_ = local.SetReadDeadline(time.Now().Add(timeout))
 			n, _, err := local.ReadFrom(buf)
 			if err != nil {
 				return
@@ -242,7 +242,7 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration
 			if _, err := remote.WriteTo(buf[:n], to); err != nil {
 				return
 			}
-			remote.SetReadDeadline(time.Now().Add(timeout))
+			_ = remote.SetReadDeadline(time.Now().Add(timeout))
 		}
 	}()
 
@@ -251,7 +251,7 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration
 		defer wg.Done()
 		buf := make([]byte, 65535)
 		for {
-			remote.SetReadDeadline(time.Now().Add(timeout))
+			_ = remote.SetReadDeadline(time.Now().Add(timeout))
 			n, _, err := remote.ReadFrom(buf)
 			if err != nil {
 				return
@@ -260,7 +260,7 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration
 			if _, err := local.WriteTo(buf[:n], nil); err != nil {
 				return
 			}
-			local.SetReadDeadline(time.Now().Add(timeout))
+			_ = local.SetReadDeadline(time.Now().Add(timeout))
 		}
 	}()
 

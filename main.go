@@ -77,6 +77,11 @@ func readConfig(filename string) (Config, error) {
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
 
+		// Skip empty values — keep defaults
+		if value == "" {
+			continue
+		}
+
 		switch key {
 		case "gateway":
 			config.Gateway = value
@@ -164,7 +169,7 @@ func main() {
 // TUN interface stays in the system after the process exits.
 func runOneshotMode(config Config) {
 	log.Println("Creating persistent TUN interface")
-	if err := createTunInterface(config.Interface, true); err != nil {
+	if _, err := createTunInterface(config.Interface, true); err != nil {
 		log.Fatalf("System error creating TUN: %v", err)
 	}
 
@@ -214,7 +219,8 @@ func runDaemonMode(config Config) {
 	}
 
 	log.Println("Creating non-persistent TUN interface (will be destroyed on exit)")
-	if err := createTunInterface(config.Interface, false); err != nil {
+	tunFile, err := createTunInterface(config.Interface, false)
+	if err != nil {
 		log.Fatalf("System error creating TUN: %v", err)
 	}
 
@@ -263,13 +269,13 @@ func runDaemonMode(config Config) {
 	}
 	log.Printf("SS proxy created: %s (method=%s)", ssAddr, config.SSMethod)
 
-	// Open TUN for I/O and start netstack tunnel
-	tunFile, err := openTunDevice(config.Interface)
+	// Wrap the open TUN fd as a device for netstack I/O
+	tunDev, err := newTUNDeviceFromFile(tunFile, config.Interface)
 	if err != nil {
-		log.Fatalf("\033[31mFailed to open TUN device: %v\033[0m", err)
+		log.Fatalf("\033[31mFailed to initialize TUN device: %v\033[0m", err)
 	}
 
-	endpoint := NewTUNEndpoint(tunFile, uint32(config.MTU))
+	endpoint := NewTUNEndpoint(tunDev, uint32(config.MTU))
 	tunnel, err := NewTunnel(proxy, endpoint)
 	if err != nil {
 		log.Fatalf("\033[31mFailed to create tunnel: %v\033[0m", err)

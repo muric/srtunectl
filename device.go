@@ -21,6 +21,19 @@ type TUNDevice struct {
 	name string
 }
 
+// newTUNDeviceFromFile wraps an already-open TUN file descriptor as a TUNDevice.
+// The file must have been obtained from createTunInterface (non-persistent mode).
+func newTUNDeviceFromFile(file *os.File, ifName string) (*TUNDevice, error) {
+	if err := syscall.SetNonblock(int(file.Fd()), true); err != nil {
+		return nil, fmt.Errorf("set nonblock: %w", err)
+	}
+	return &TUNDevice{
+		file: file,
+		fd:   int(file.Fd()),
+		name: ifName,
+	}, nil
+}
+
 // openTunDevice opens an existing TUN interface for read/write.
 // This does NOT create the interface — it must already exist.
 func openTunDevice(ifName string) (*TUNDevice, error) {
@@ -36,13 +49,12 @@ func openTunDevice(ifName string) (*TUNDevice, error) {
 
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), uintptr(TUNSETIFF), uintptr(unsafe.Pointer(&ifr)))
 	if errno != 0 {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("ioctl TUNSETIFF: %v", errno)
 	}
 
-	// Set non-blocking mode for the fd
 	if err := syscall.SetNonblock(int(file.Fd()), true); err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("set nonblock: %w", err)
 	}
 
@@ -156,7 +168,7 @@ func (e *TUNEndpoint) SetOnCloseAction(func()) {}
 // Close stops the dispatch loop and closes the TUN device.
 func (e *TUNEndpoint) Close() {
 	close(e.done)
-	e.tunDev.Close()
+	_ = e.tunDev.Close()
 }
 
 // dispatchLoop reads raw IP packets from the TUN device and delivers
@@ -288,7 +300,7 @@ func (e *TUNEndpoint) handleICMPv4Echo(pkt []byte) bool {
 	reply[icmp+2] = byte(icmpCsum >> 8)
 	reply[icmp+3] = byte(icmpCsum)
 
-	syscall.Write(e.tunDev.fd, reply)
+	_, _ = syscall.Write(e.tunDev.fd, reply)
 	return true
 }
 
@@ -329,7 +341,7 @@ func (e *TUNEndpoint) handleICMPv6Echo(pkt []byte) bool {
 	reply[icmp+2] = byte(csum >> 8)
 	reply[icmp+3] = byte(csum)
 
-	syscall.Write(e.tunDev.fd, reply)
+	_, _ = syscall.Write(e.tunDev.fd, reply)
 	return true
 }
 

@@ -83,7 +83,7 @@ func stopPlugin(p *PluginProcess) {
 	// Send SIGTERM
 	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		log.Printf("Failed to send SIGTERM to plugin: %v", err)
-		p.cmd.Process.Kill()
+		_ = p.cmd.Process.Kill()
 		return
 	}
 
@@ -98,7 +98,7 @@ func stopPlugin(p *PluginProcess) {
 		log.Println("Plugin stopped gracefully")
 	case <-time.After(5 * time.Second):
 		log.Println("Plugin did not stop in time, sending SIGKILL")
-		p.cmd.Process.Kill()
+		_ = p.cmd.Process.Kill()
 		<-done
 	}
 }
@@ -110,6 +110,6 @@ func findFreePort() (int, error) {
 		return 0, err
 	}
 	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
+	_ = l.Close()
 	return port, nil
 }

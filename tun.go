@@ -24,18 +24,15 @@ type ifreq struct {
 }
 
 // createTunInterface creates a TUN interface with the given name.
-// If persistent is true, the interface survives after the process exits.
-// If persistent is false, the interface is destroyed when the last fd is closed.
-func createTunInterface(ifName string, persistent bool) error {
+// If persistent is true, the interface survives after the process exits;
+// the fd is closed and nil is returned.
+// If persistent is false, the open *os.File is returned to the caller.
+// The caller MUST keep it open — closing the last fd destroys the interface.
+func createTunInterface(ifName string, persistent bool) (*os.File, error) {
 	file, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer func() {
-		if cerr := file.Close(); cerr != nil {
-			log.Printf("Error closing /dev/net/tun: %v", cerr)
-		}
-	}()
 
 	ifr := ifreq{
 		ifrFlags: IFF_TUN | IFF_NO_PI,
@@ -44,24 +41,23 @@ func createTunInterface(ifName string, persistent bool) error {
 
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), uintptr(TUNSETIFF), uintptr(unsafe.Pointer(&ifr)))
 	if errno != 0 {
-		if errno == syscall.EEXIST || errno == syscall.EBUSY {
-			fmt.Println("Interface already exists")
-			return nil
-		}
-		return errno
+		_ = file.Close()
+		return nil, fmt.Errorf("ioctl TUNSETIFF for %s: %v", ifName, errno)
 	}
 
 	if persistent {
 		_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), uintptr(TUNSETPERSIST), 1)
 		if errno != 0 {
-			return errno
+			_ = file.Close()
+			return nil, errno
 		}
 		log.Printf("Interface %s is now persistent", ifName)
-	} else {
-		log.Printf("Interface %s created (non-persistent)", ifName)
+		_ = file.Close()
+		return nil, nil
 	}
 
-	return nil
+	log.Printf("Interface %s created (non-persistent, fd kept open)", ifName)
+	return file, nil
 }
 
 // setIpTunInterface assigns an IP address and MTU to the TUN interface and brings it up.

@@ -62,11 +62,11 @@ func (ss *SSProxy) DialContext(ctx context.Context, targetAddr string) (net.Conn
 	// Write target address in SOCKS5 format (SS protocol standard)
 	tgt := socks.ParseAddr(targetAddr)
 	if tgt == nil {
-		c.Close()
+		_ = c.Close()
 		return nil, fmt.Errorf("failed to parse target address: %s", targetAddr)
 	}
 	if _, err := c.Write(tgt); err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, fmt.Errorf("failed to write target address: %w", err)
 	}
 
@@ -82,7 +82,7 @@ func (ss *SSProxy) DialUDP() (net.PacketConn, error) {
 
 	udpAddr, err := net.ResolveUDPAddr("udp", ss.addr)
 	if err != nil {
-		pc.Close()
+		_ = pc.Close()
 		return nil, fmt.Errorf("resolve SS server UDP address %s: %w", ss.addr, err)
 	}
 
