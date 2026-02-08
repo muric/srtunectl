@@ -15,7 +15,7 @@ const (
 	defaultGoroutineCount = 4
 	defaultDebug          = false
 	defaultMTU            = 1500
-	defaultSSMTU          = 1400
+	defaultSSMTU          = 1500
 )
 
 type Config struct {
