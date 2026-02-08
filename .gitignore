@@ -1,6 +1,6 @@
 # Ignore config file
 iproute.conf
-
+srtunectl.conf
 # Ignore binary
 iproute
 srtunectl

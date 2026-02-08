@@ -1,0 +1,14 @@
+[Unit]
+Description=srtunectl - routes and shadowsocks tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@IPROUTE_GIT_DIR@
+ExecStart=/usr/bin/srtunectl
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

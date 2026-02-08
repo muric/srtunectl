@@ -2,17 +2,20 @@
 APP_NAME := srtunectl
 SYSTEMD_DIR := /etc/systemd/system
 NETWORK_DIR := /etc/systemd/network
-SERVICE_NAME := route.service
-IPROUTE_CONF := iproute.conf
+SERVICE_NAME := ${APP_NAME}.service
+IPROUTE_CONF := srtunectl.conf
 IPROUTE_GIT_DIR := $(shell pwd)
 
 # Default target
 all: build
 
+tidy:
+	go mod tidy
+
 # Build target
-build:
+build: tidy
 	@echo "Building the application..."
-	go build -o ./output/${APP_NAME} main.go
+	go build -o ./output/${APP_NAME} .
 
 # Clean target
 clean:
@@ -37,7 +40,7 @@ install: build
 	# Install systemd service
 	install -d $(SYSTEMD_DIR)
 	sed -e 's|@IPROUTE_GIT_DIR@|$(IPROUTE_GIT_DIR)|g' \
-		route.service.in \
+		$(APP_NAME).service.in \
 		> $(SYSTEMD_DIR)/$(SERVICE_NAME)
 
 	systemctl daemon-reload

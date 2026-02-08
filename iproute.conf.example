@@ -1,6 +1,0 @@
-gateway=10.0.0.1
-interface=tun2
-goroutine_count=1000
-debug=false
-default_gw=192.168.1.1
-default_interface=eth0

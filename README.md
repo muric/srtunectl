@@ -53,7 +53,7 @@ srtunectl — лёгкая утилита для управления систе
 ### Установка
 1. Скопируйте пример конфигурации:
 ```bash
-cp iproute.conf.example iproute.conf
+cp srtunectl.conf.example srtunectl.conf
 ```
 
 2. Соберите бинарник:
@@ -68,11 +68,11 @@ sudo make install
 
 Примечания по установке (соответствует Makefile в репозитории):
 - Бинарник устанавливается в `/usr/bin/srtunectl`.  
-- Makefile генерирует systemd-unit `/etc/systemd/system/route.service` из шаблона `route.service.in` и вызывает `systemctl daemon-reload` и `systemctl enable route.service`.
+- Makefile генерирует systemd-unit `/etc/systemd/system/srtuncectl.service` из шаблона `srtunectl.service.in` и вызывает `systemctl daemon-reload` и `systemctl enable srtunectl.service`.
 
 <a id="ru-configuration"></a>
 ### Конфигурация
-Файл примера: `iproute.conf.example`. В конфигурации обычно указываются:
+Файл примера: `srtunectl.conf.example`. В конфигурации обычно указываются:
 
 - Список сетей или подсетей для маршрутизации  
 - Имя tun-интерфейса (например, `tun0`)  
@@ -99,12 +99,12 @@ ip route
 
 Проверить статус systemd-сервиса (если вы устанавливали через `make install`):
 ```bash
-sudo systemctl status route.service
+sudo systemctl status srtunectl.service
 ```
 
 Просмотр логов сервиса:
 ```bash
-sudo journalctl -u route.service -f
+sudo journalctl -u srtunectl.service -f
 ```
 
 <a id="ru-debugging"></a>
@@ -113,11 +113,11 @@ sudo journalctl -u route.service -f
 ```bash
 ip a
 ```
-- Убедитесь, что в `iproute.conf` корректно указаны gateway, имя интерфейса и подсети.  
+- Убедитесь, что в `srtunectl.conf` корректно указаны gateway, имя интерфейса и подсети.  
 - Проверьте валидность JSON-файлов в папке `data`.  
 - Просмотрите логи systemd при запуске как службы:
 ```bash
-sudo journalctl -u route.service
+sudo journalctl -u srtunectl.service
 ```
 - Запускайте утилиту вручную под sudo, чтобы увидеть вывод в консоли:
 ```bash
@@ -161,7 +161,7 @@ All JSON files located in the `data` folder are parsed and added as routes throu
 ### Installation
 1. Copy the example configuration:
 ```bash
-cp iproute.conf.example iproute.conf
+cp srtunectl.conf.example srtunectl.conf
 ```
 
 2. Build the binary:
@@ -176,11 +176,11 @@ sudo make install
 
 Notes regarding installation (matches Makefile in repository):
 - The binary is installed to `/usr/bin/srtunectl`.  
-- The Makefile generates the systemd unit `/etc/systemd/system/route.service` from the template `route.service.in` and runs `systemctl daemon-reload` and `systemctl enable route.service`.
+- The Makefile generates the systemd unit `/etc/systemd/system/srtunectl.service` from the template `srtunectl.service.in` and runs `systemctl daemon-reload` and `systemctl enable srtunectl.service`.
 
 <a id="en-configuration"></a>
 ### Configuration
-Example config file: `iproute.conf.example`. Typically the configuration includes:
+Example config file: `srtunectl.conf.example`. Typically the configuration includes:
 
 - List of networks or subnets to route  
 - Tun interface name (e.g., `tun0`)  
@@ -207,12 +207,12 @@ ip route
 
 Check systemd service status (if installed via `make install`):
 ```bash
-sudo systemctl status route.service
+sudo systemctl status srtunectl.service
 ```
 
 View service logs:
 ```bash
-sudo journalctl -u route.service -f
+sudo journalctl -u srtunectl.service -f
 ```
 
 <a id="en-debugging"></a>
@@ -221,11 +221,11 @@ sudo journalctl -u route.service -f
 ```bash
 ip a
 ```
-- Verify gateway, interface name, and subnets in `iproute.conf`.  
+- Verify gateway, interface name, and subnets in `srtunectl.conf`.  
 - Validate JSON files in the `data` folder.  
 - Check systemd logs when running as a service:
 ```bash
-sudo journalctl -u route.service
+sudo journalctl -u srtunectl.service
 ```
 - Run the tool manually under sudo to see console output:
 ```bash
