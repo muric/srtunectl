@@ -150,7 +150,7 @@ func readConfig(filename string) (Config, error) {
 }
 
 func main() {
-	config, err := readConfig("iproute.conf")
+	config, err := readConfig("srtunectl.conf")
 	if err != nil {
 		log.Fatalf("\033[31mError reading configuration: %v\033[0m", err)
 	}
