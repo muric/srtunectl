@@ -6,7 +6,6 @@ import (
 	"os"
 	"sync"
 	"syscall"
-	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -28,37 +27,6 @@ func newTUNDeviceFromFile(file *os.File, ifName string) (*TUNDevice, error) {
 	if err := syscall.SetNonblock(int(file.Fd()), true); err != nil {
 		return nil, fmt.Errorf("set nonblock: %w", err)
 	}
-	return &TUNDevice{
-		file: file,
-		fd:   int(file.Fd()),
-		name: ifName,
-	}, nil
-}
-
-// openTunDevice opens an existing TUN interface for read/write.
-// This does NOT create the interface — it must already exist.
-func openTunDevice(ifName string) (*TUNDevice, error) {
-	file, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open /dev/net/tun: %w", err)
-	}
-
-	ifr := ifreq{
-		ifrFlags: IFF_TUN | IFF_NO_PI,
-	}
-	copy(ifr.ifrName[:], ifName)
-
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), uintptr(TUNSETIFF), uintptr(unsafe.Pointer(&ifr)))
-	if errno != 0 {
-		_ = file.Close()
-		return nil, fmt.Errorf("ioctl TUNSETIFF: %v", errno)
-	}
-
-	if err := syscall.SetNonblock(int(file.Fd()), true); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("set nonblock: %w", err)
-	}
-
 	return &TUNDevice{
 		file: file,
 		fd:   int(file.Fd()),
