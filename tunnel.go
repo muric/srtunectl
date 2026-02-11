@@ -157,7 +157,12 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 	log.Printf("[TCP] %s <-> %s", srcAddr, dstAddr)
 
 	// Bidirectional relay
-	pipe(localConn, remoteConn)
+	//pipe(localConn, remoteConn)
+	if err := pipe(localConn, remoteConn); err != nil {
+    		log.Printf("[TCP] %s <-> %s: relay error: %v", srcAddr, dstAddr, err)
+    		return
+	}
+
 }
 
 // relayUDP relays a UDP session through the SS proxy.
