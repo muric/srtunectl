@@ -25,7 +25,7 @@ const (
 	tcpConnectTimeout = 5 * time.Second
 	tcpWaitTimeout    = 60 * time.Second
 	udpSessionTimeout = 60 * time.Second
-	relayBufferSize   = 32 * 1024
+	relayBufferSize   = 1024 * 1024
 	nicID             = 1
 )
 
