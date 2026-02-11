@@ -23,8 +23,8 @@ import (
 
 const (
 	tcpConnectTimeout = 5 * time.Second
-	tcpIdleTimeout    = 60 * time.Second // close direction after this much inactivity
-	udpSessionTimeout = 60 * time.Second
+	tcpIdleTimeout    = 5 * time.Minute // close direction after this much inactivity
+	udpSessionTimeout = 2 * time.Minute
 	relayBufferSize   = 32 * 1024 // 32 KB per direction (matches io.Copy default)
 	nicID             = 1
 )
@@ -107,7 +107,7 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 			// Endpoint already exists — packet handled by existing session
 			return true
 		}
-		go t.relayUDP(r.ID(), &wq, ep)
+		go t.relayUDP(r.ID(), &wq, ep, time.Now())
 		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
@@ -155,6 +155,7 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 // handleTCP handles a new TCP connection from the netstack.
 // It dials the SS proxy and relays data bidirectionally.
 func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
+	startTime := time.Now()
 	id := r.ID()
 	srcAddr := fmt.Sprintf("%s:%d", id.RemoteAddress.String(), id.RemotePort)
 	dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
@@ -177,23 +178,23 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 
 	remoteConn, err := t.proxy.DialContext(ctx, dstAddr)
 	if err != nil {
-		log.Printf("[TCP] %s <-> %s: dial failed: %v", srcAddr, dstAddr, err)
+		log.Printf("[TCP] %s <-> %s: dial failed (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
 		return
 	}
 	defer func() { _ = remoteConn.Close() }()
 
-	log.Printf("[TCP] %s <-> %s", srcAddr, dstAddr)
+	log.Printf("[TCP] %s <-> %s (dial %v)", srcAddr, dstAddr, time.Since(startTime))
 
 	// Bidirectional relay
 	if err := pipe(localConn, remoteConn); err != nil {
-		log.Printf("[TCP] %s <-> %s: relay error: %v", srcAddr, dstAddr, err)
+		log.Printf("[TCP] %s <-> %s: relay error (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
 	}
-
 }
 
 // relayUDP relays a UDP session through the SS proxy.
 // The endpoint is already created and registered by the forwarder handler.
-func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcpip.Endpoint) {
+// arriveTime is when the first packet hit the forwarder (before goroutine start).
+func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcpip.Endpoint, arriveTime time.Time) {
 	srcAddr := fmt.Sprintf("%s:%d", id.RemoteAddress.String(), id.RemotePort)
 	dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
 
@@ -203,7 +204,7 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 	// Dial UDP through SS proxy
 	remotePC, err := t.proxy.DialUDP()
 	if err != nil {
-		log.Printf("[UDP] %s <-> %s: dial failed: %v", srcAddr, dstAddr, err)
+		log.Printf("[UDP] %s <-> %s: dial failed (setup %v): %v", srcAddr, dstAddr, time.Since(arriveTime), err)
 		return
 	}
 	defer func() { _ = remotePC.Close() }()
@@ -214,7 +215,7 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 		return
 	}
 
-	log.Printf("[UDP] %s <-> %s", srcAddr, dstAddr)
+	log.Printf("[UDP] %s <-> %s (setup %v)", srcAddr, dstAddr, time.Since(arriveTime))
 
 	// Bidirectional packet relay
 	pipePacket(localConn, remotePC, remote, udpSessionTimeout)
