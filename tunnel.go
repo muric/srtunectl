@@ -25,7 +25,7 @@ const (
 	tcpConnectTimeout = 5 * time.Second
 	tcpWaitTimeout    = 60 * time.Second
 	udpSessionTimeout = 60 * time.Second
-	relayBufferSize   = 32 * 1024
+	relayBufferSize   = 1024 * 1024
 	nicID             = 1
 )
 
@@ -157,7 +157,12 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 	log.Printf("[TCP] %s <-> %s", srcAddr, dstAddr)
 
 	// Bidirectional relay
-	pipe(localConn, remoteConn)
+	//pipe(localConn, remoteConn)
+	if err := pipe(localConn, remoteConn); err != nil {
+    		log.Printf("[TCP] %s <-> %s: relay error: %v", srcAddr, dstAddr, err)
+    		return
+	}
+
 }
 
 // relayUDP relays a UDP session through the SS proxy.
@@ -198,32 +203,70 @@ func (t *Tunnel) Close() {
 	t.endpoint.Close()
 }
 
-// pipe copies data bidirectionally between two connections.
-func pipe(a, b net.Conn) {
+// pipe copies data bidirectionally between two net.Conn.
+// It runs two goroutines that copy in opposite directions and waits
+// for both to finish. Improvements over a naive implementation:
+// - Captures and returns the first non-EOF error from io.CopyBuffer so
+//   callers can react to I/O failures.
+// - Uses sync.Once to ensure CloseWrite (half-close) is called only once
+//   per connection if supported, otherwise falls back to closing the
+//   whole connection (best-effort).
+// - Sets a read deadline after closing to unblock the peer's read loop.
+// - Enables TCP keep-alive (best-effort) for long-lived connections.
+// - Allocates a separate buffer per goroutine to avoid sharing state.
+func pipe(a, b net.Conn) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, relayBufferSize)
-		_, _ = io.CopyBuffer(b, a, buf)
-		if tc, ok := b.(interface{ CloseWrite() error }); ok {
-			_ = tc.CloseWrite()
-		}
-		_ = b.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
-	}()
+	// channel to capture errors from both copy directions
+	errCh := make(chan error, 2)
 
-	go func() {
+	// closable type for half-close support
+	type closable interface {
+		CloseWrite() error
+	}
+	var onceA, onceB sync.Once
+
+	copyFunc := func(dst, src net.Conn, once *sync.Once, name string) {
 		defer wg.Done()
 		buf := make([]byte, relayBufferSize)
-		_, _ = io.CopyBuffer(a, b, buf)
-		if tc, ok := a.(interface{ CloseWrite() error }); ok {
-			_ = tc.CloseWrite()
+		_, err := io.CopyBuffer(dst, src, buf)
+		if err != nil && err != io.EOF {
+			errCh <- fmt.Errorf("%s copy error: %w", name, err)
 		}
-		_ = a.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
-	}()
+		// attempt half-close, fall back to full close if not supported
+		if tc, ok := dst.(closable); ok {
+			once.Do(func() { _ = tc.CloseWrite() })
+		} else {
+			_ = dst.Close()
+		}
+		// set read deadline to unblock peer reader
+		_ = dst.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
+	}
+
+	// enable TCP keep-alive when possible (best-effort)
+	if tc, ok := a.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+	if tc, ok := b.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	go copyFunc(b, a, &onceB, "a->b")
+	go copyFunc(a, b, &onceA, "b->a")
 
 	wg.Wait()
+	close(errCh)
+
+	// return first non-nil error if present
+	for e := range errCh {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
 
 // pipePacket copies packets bidirectionally between two PacketConns.
