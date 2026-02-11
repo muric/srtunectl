@@ -7,6 +7,7 @@ import (
 	"sync"
 	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -152,8 +153,11 @@ func (e *TUNEndpoint) Close() {
 
 // dispatchLoop reads raw IP packets from the TUN device and delivers
 // them to the gVisor netstack for processing.
+// Uses poll() to wait for data instead of busy-looping on EAGAIN,
+// which previously consumed 100% CPU on one core.
 func (e *TUNEndpoint) dispatchLoop() {
 	buf := make([]byte, e.mtu+4) // extra room for safety
+	pollFds := []unix.PollFd{{Fd: int32(e.tunDev.fd), Events: unix.POLLIN}}
 
 	for {
 		select {
@@ -162,10 +166,24 @@ func (e *TUNEndpoint) dispatchLoop() {
 		default:
 		}
 
+		// Wait for data with 100ms timeout.
+		// Allows periodic done-channel checks without CPU spinning.
+		pn, pollErr := unix.Poll(pollFds, 100)
+		if pn <= 0 {
+			if pollErr != nil && pollErr != unix.EINTR {
+				select {
+				case <-e.done:
+					return
+				default:
+					continue
+				}
+			}
+			continue // timeout, check done channel
+		}
+
 		n, err := syscall.Read(e.tunDev.fd, buf)
 		if err != nil {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-				// Non-blocking: no data available, try again
 				continue
 			}
 			select {

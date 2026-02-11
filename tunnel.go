@@ -55,6 +55,34 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 		},
 	})
 
+	// TCP performance tuning for proxy/streaming workloads.
+	// gVisor defaults are optimized for containers, not high-throughput proxying.
+	rcvBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{
+		Min:     4 << 10,   // 4 KB
+		Default: 212 << 10, // 212 KB
+		Max:     4 << 20,   // 4 MB
+	}
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBufOpt)
+
+	sndBufOpt := tcpip.TCPSendBufferSizeRangeOption{
+		Min:     4 << 10,   // 4 KB
+		Default: 212 << 10, // 212 KB
+		Max:     4 << 20,   // 4 MB
+	}
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBufOpt)
+
+	// Enable Selective Acknowledgment for better loss recovery
+	sackOpt := tcpip.TCPSACKEnabled(true)
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackOpt)
+
+	// Enable receive buffer auto-tuning (grows window as needed)
+	moderateOpt := tcpip.TCPModerateReceiveBufferOption(true)
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &moderateOpt)
+
+	// Use cubic congestion control (better for high-bandwidth links)
+	ccOpt := tcpip.CongestionControlOption("cubic")
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
+
 	t := &Tunnel{
 		stack:    s,
 		proxy:    proxy,
