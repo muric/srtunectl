@@ -276,11 +276,17 @@ func pipe(a, b net.Conn) error {
 		_, err := io.CopyBuffer(dst, reader, buf)
 		if err != nil && err != io.EOF {
 			errCh <- fmt.Errorf("%s copy error: %w", name, err)
+			// Connection is broken (reset, network error, etc.).
+			// Close both sides immediately so the peer goroutine
+			// doesn't linger for tcpIdleTimeout on a dead connection.
+			_ = dst.Close()
+			_ = src.Close()
+			return
 		}
-		// Signal peer that this direction is done via half-close if
-		// supported. SS cipher wrappers don't implement CloseWrite —
-		// skip silently; the other goroutine's idleReader will
-		// eventually time out when the remote stops sending.
+		// Clean EOF: signal peer that this direction is done via
+		// half-close if supported. SS cipher wrappers don't implement
+		// CloseWrite — skip; the other goroutine's idleReader will
+		// time out when the remote stops sending.
 		if tc, ok := dst.(halfCloser); ok {
 			_ = tc.CloseWrite()
 		}
