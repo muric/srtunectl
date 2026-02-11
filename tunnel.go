@@ -23,9 +23,9 @@ import (
 
 const (
 	tcpConnectTimeout = 5 * time.Second
-	tcpWaitTimeout    = 60 * time.Second
+	tcpIdleTimeout    = 60 * time.Second // close direction after this much inactivity
 	udpSessionTimeout = 60 * time.Second
-	relayBufferSize   = 1024 * 1024
+	relayBufferSize   = 32 * 1024 // 32 KB per direction (matches io.Copy default)
 	nicID             = 1
 )
 
@@ -185,10 +185,8 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 	log.Printf("[TCP] %s <-> %s", srcAddr, dstAddr)
 
 	// Bidirectional relay
-	//pipe(localConn, remoteConn)
 	if err := pipe(localConn, remoteConn); err != nil {
-    		log.Printf("[TCP] %s <-> %s: relay error: %v", srcAddr, dstAddr, err)
-    		return
+		log.Printf("[TCP] %s <-> %s: relay error: %v", srcAddr, dstAddr, err)
 	}
 
 }
@@ -231,48 +229,63 @@ func (t *Tunnel) Close() {
 	t.endpoint.Close()
 }
 
-// pipe copies data bidirectionally between two net.Conn.
-// It runs two goroutines that copy in opposite directions and waits
-// for both to finish. Improvements over a naive implementation:
-// - Captures and returns the first non-EOF error from io.CopyBuffer so
-//   callers can react to I/O failures.
-// - Uses sync.Once to ensure CloseWrite (half-close) is called only once
-//   per connection if supported, otherwise falls back to closing the
-//   whole connection (best-effort).
-// - Sets a read deadline after closing to unblock the peer's read loop.
-// - Enables TCP keep-alive (best-effort) for long-lived connections.
-// - Allocates a separate buffer per goroutine to avoid sharing state.
+// idleReader wraps a net.Conn and resets the read deadline before every
+// Read call. As long as data keeps arriving within tcpIdleTimeout the
+// connection stays alive. Only when the source goes silent for the full
+// idle period does the Read return a timeout error.
+type idleReader struct {
+	conn    net.Conn
+	timeout time.Duration
+}
+
+func (r *idleReader) Read(p []byte) (int, error) {
+	_ = r.conn.SetReadDeadline(time.Now().Add(r.timeout))
+	return r.conn.Read(p)
+}
+
+// pipe copies data bidirectionally between two net.Conn and waits
+// for both directions to finish. Returns the first non-EOF error.
+//
+// Each direction uses idleReader: read deadline is reset before every
+// Read, so a connection stays open as long as data flows. When one
+// direction finishes (client done sending), the other keeps running
+// until the remote side closes or goes idle for tcpIdleTimeout.
+//
+// If the connection supports half-close (CloseWrite), a TCP FIN is
+// sent to signal the peer. SS cipher wrappers don't support it —
+// that's fine, the idle timeout handles cleanup without killing
+// the reverse direction.
+//
+// Both connections are closed by the caller (handleTCP defers)
+// after pipe returns.
 func pipe(a, b net.Conn) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// channel to capture errors from both copy directions
 	errCh := make(chan error, 2)
 
-	// closable type for half-close support
-	type closable interface {
+	type halfCloser interface {
 		CloseWrite() error
 	}
-	var onceA, onceB sync.Once
 
-	copyFunc := func(dst, src net.Conn, once *sync.Once, name string) {
+	copyFunc := func(dst, src net.Conn, name string) {
 		defer wg.Done()
 		buf := make([]byte, relayBufferSize)
-		_, err := io.CopyBuffer(dst, src, buf)
+		reader := &idleReader{conn: src, timeout: tcpIdleTimeout}
+		_, err := io.CopyBuffer(dst, reader, buf)
 		if err != nil && err != io.EOF {
 			errCh <- fmt.Errorf("%s copy error: %w", name, err)
 		}
-		// attempt half-close, fall back to full close if not supported
-		if tc, ok := dst.(closable); ok {
-			once.Do(func() { _ = tc.CloseWrite() })
-		} else {
-			_ = dst.Close()
+		// Signal peer that this direction is done via half-close if
+		// supported. SS cipher wrappers don't implement CloseWrite —
+		// skip silently; the other goroutine's idleReader will
+		// eventually time out when the remote stops sending.
+		if tc, ok := dst.(halfCloser); ok {
+			_ = tc.CloseWrite()
 		}
-		// set read deadline to unblock peer reader
-		_ = dst.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
 	}
 
-	// enable TCP keep-alive when possible (best-effort)
+	// Enable TCP keep-alive for long-lived connections (best-effort)
 	if tc, ok := a.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
@@ -282,13 +295,12 @@ func pipe(a, b net.Conn) error {
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	go copyFunc(b, a, &onceB, "a->b")
-	go copyFunc(a, b, &onceA, "b->a")
+	go copyFunc(b, a, "a->b")
+	go copyFunc(a, b, "b->a")
 
 	wg.Wait()
 	close(errCh)
 
-	// return first non-nil error if present
 	for e := range errCh {
 		if e != nil {
 			return e
@@ -339,3 +351,5 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration
 
 	wg.Wait()
 }
+
+
