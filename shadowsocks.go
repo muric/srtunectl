@@ -84,6 +84,10 @@ func (ss *SSProxy) DialUDP() (net.PacketConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen UDP: %w", err)
 	}
+	if udpConn, ok := pc.(*net.UDPConn); ok {
+		_ = udpConn.SetReadBuffer(4 << 20)
+		_ = udpConn.SetWriteBuffer(4 << 20)
+	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", ss.addr)
 	if err != nil {
@@ -115,7 +119,12 @@ func (pc *ssPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if tgt == nil {
 		return 0, fmt.Errorf("failed to parse target address: %s", addr)
 	}
+	return pc.WriteToTarget(b, tgt)
+}
 
+// WriteToTarget writes a UDP payload to a pre-parsed SOCKS target address.
+// This avoids per-packet target parsing in hot paths.
+func (pc *ssPacketConn) WriteToTarget(b []byte, tgt socks.Addr) (int, error) {
 	needed := len(tgt) + len(b)
 	buf := pc.bufPool.Get().([]byte)
 	if cap(buf) < needed {
@@ -126,8 +135,7 @@ func (pc *ssPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	copy(buf[len(tgt):], b)
 	defer pc.bufPool.Put(buf[:0])
 
-	_, err := pc.PacketConn.WriteTo(buf, pc.rAddr)
-	if err != nil {
+	if _, err := pc.PacketConn.WriteTo(buf, pc.rAddr); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -145,16 +153,11 @@ func (pc *ssPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		return 0, nil, fmt.Errorf("failed to parse SOCKS address from response")
 	}
 
-	// Resolve the SOCKS address to a UDP address
-	udpAddr, resolveErr := net.ResolveUDPAddr("udp", tgt.String())
-	if resolveErr != nil {
-		return 0, nil, fmt.Errorf("resolve response address: %w", resolveErr)
-	}
-
 	// Return data after the address header
 	addrLen := len(tgt)
 	copy(b, b[addrLen:n])
-	return n - addrLen, udpAddr, err
+	// Caller currently ignores addr; return server addr to avoid DNS work.
+	return n - addrLen, pc.rAddr, err
 }
 
 // applyObfs wraps a connection with simple-obfs (HTTP or TLS mode).

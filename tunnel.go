@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/shadowsocks/go-shadowsocks2/socks"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -248,11 +249,16 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 		log.Printf("[UDP] resolve %s: %v", dstAddr, err)
 		return
 	}
+	targetAddr := socks.ParseAddr(dstAddr)
+	if targetAddr == nil {
+		log.Printf("[UDP] failed to parse target addr: %s", dstAddr)
+		return
+	}
 
 	log.Printf("[UDP] %s <-> %s (setup %v)", srcAddr, dstAddr, time.Since(arriveTime))
 
 	// Bidirectional packet relay
-	if err := pipePacket(localConn, remotePC, remote, udpSessionTimeout); err != nil {
+	if err := pipePacket(localConn, remotePC, remote, targetAddr, udpSessionTimeout); err != nil {
 		if isTimeoutError(err) {
 			atomic.AddUint64(&udpRelayTimeouts, 1)
 			log.Printf("[UDP] %s <-> %s: relay timeout: %v", srcAddr, dstAddr, err)
@@ -371,7 +377,7 @@ func pipe(a, b net.Conn) error {
 // pipePacket copies packets bidirectionally between two PacketConns.
 // On any read/write error it closes both conns so the peer goroutine
 // exits immediately instead of lingering until timeout.
-func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration) error {
+func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr, timeout time.Duration) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	errCh := make(chan error, 2)
@@ -394,6 +400,14 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration
 				errCh <- fmt.Errorf("local->remote read: %w", err)
 				closeBoth()
 				return
+			}
+			if ssConn, ok := remote.(*ssPacketConn); ok {
+				if _, err := ssConn.WriteToTarget(buf[:n], targetAddr); err != nil {
+					errCh <- fmt.Errorf("local->remote write: %w", err)
+					closeBoth()
+					return
+				}
+				continue
 			}
 			if _, err := remote.WriteTo(buf[:n], to); err != nil {
 				errCh <- fmt.Errorf("local->remote write: %w", err)
