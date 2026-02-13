@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -20,6 +21,18 @@ type TUNDevice struct {
 	fd   int
 	mtu  int
 	name string
+}
+
+var (
+	tunPacketsDispatched uint64
+	tunReadErrors        uint64
+	tunICMPReplies       uint64
+)
+
+func snapshotTUNStats() (packets, readErrors, icmpReplies uint64) {
+	return atomic.LoadUint64(&tunPacketsDispatched),
+		atomic.LoadUint64(&tunReadErrors),
+		atomic.LoadUint64(&tunICMPReplies)
 }
 
 // newTUNDeviceFromFile wraps an already-open TUN file descriptor as a TUNDevice.
@@ -186,6 +199,7 @@ func (e *TUNEndpoint) dispatchLoop() {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 				continue
 			}
+			atomic.AddUint64(&tunReadErrors, 1)
 			select {
 			case <-e.done:
 				return
@@ -218,6 +232,7 @@ func (e *TUNEndpoint) dispatchLoop() {
 		// This gives <1ms ping for TUN-routed IPs — a quick diagnostic
 		// that the route goes through the tunnel.
 		if e.handleICMPEcho(pktData, proto) {
+			atomic.AddUint64(&tunICMPReplies, 1)
 			continue
 		}
 
@@ -226,6 +241,7 @@ func (e *TUNEndpoint) dispatchLoop() {
 			Payload: buffer.MakeWithData(pktData),
 		})
 		e.dispatcher.DeliverNetworkPacket(proto, pkt)
+		atomic.AddUint64(&tunPacketsDispatched, 1)
 		pkt.DecRef()
 	}
 }

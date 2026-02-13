@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/shadowsocks/go-shadowsocks2/core"
@@ -21,6 +22,7 @@ type SSProxy struct {
 	cipher   core.Cipher // AEAD cipher for encryption
 	obfsMode string      // "http", "tls", or "" (no obfuscation)
 	obfsHost string      // host to impersonate for obfuscation
+	udpPool  sync.Pool
 }
 
 // NewSSProxy creates a new Shadowsocks proxy.
@@ -38,6 +40,9 @@ func NewSSProxy(addr, method, password, obfsMode, obfsHost string) (*SSProxy, er
 		cipher:   cipher,
 		obfsMode: obfsMode,
 		obfsHost: obfsHost,
+		udpPool: sync.Pool{
+			New: func() any { return make([]byte, 0, 65535) },
+		},
 	}, nil
 }
 
@@ -89,14 +94,19 @@ func (ss *SSProxy) DialUDP() (net.PacketConn, error) {
 	// Wrap with SS cipher
 	pc = ss.cipher.PacketConn(pc)
 
-	return &ssPacketConn{PacketConn: pc, rAddr: udpAddr}, nil
+	return &ssPacketConn{
+		PacketConn: pc,
+		rAddr:      udpAddr,
+		bufPool:    &ss.udpPool,
+	}, nil
 }
 
 // ssPacketConn wraps a PacketConn to always send to the SS server
 // with the target address prepended in SOCKS5 format.
 type ssPacketConn struct {
 	net.PacketConn
-	rAddr net.Addr
+	rAddr   net.Addr
+	bufPool *sync.Pool
 }
 
 func (pc *ssPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
@@ -106,11 +116,21 @@ func (pc *ssPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 		return 0, fmt.Errorf("failed to parse target address: %s", addr)
 	}
 
-	buf := make([]byte, len(tgt)+len(b))
+	needed := len(tgt) + len(b)
+	buf := pc.bufPool.Get().([]byte)
+	if cap(buf) < needed {
+		buf = make([]byte, needed)
+	}
+	buf = buf[:needed]
 	copy(buf, tgt)
 	copy(buf[len(tgt):], b)
+	defer pc.bufPool.Put(buf[:0])
 
-	return pc.PacketConn.WriteTo(buf, pc.rAddr)
+	_, err := pc.PacketConn.WriteTo(buf, pc.rAddr)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func (pc *ssPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {

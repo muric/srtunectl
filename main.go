@@ -15,7 +15,7 @@ const (
 	defaultGoroutineCount = 4
 	defaultDebug          = false
 	defaultMTU            = 1500
-	defaultSSMTU          = 1500
+	defaultSSMTU          = 1400
 )
 
 type Config struct {
@@ -154,6 +154,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("\033[31mError reading configuration: %v\033[0m", err)
 	}
+	log.Printf("Config loaded: ss_enabled=%t mtu=%d", config.SSEnabled, config.MTU)
 
 	if !config.SSEnabled {
 		// Oneshot mode: create persistent TUN, add routes, exit.
