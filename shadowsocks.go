@@ -43,8 +43,6 @@ func NewSSProxy(addr, method, password, obfsMode, obfsHost string) (*SSProxy, er
 
 // DialContext establishes a TCP connection through the Shadowsocks server
 // to the given target address (host:port).
-// DialContext establishes a TCP connection through the Shadowsocks server
-// to the given target address (host:port).
 func (ss *SSProxy) DialContext(ctx context.Context, targetAddr string) (net.Conn, error) {
 	// fast check before start connect
 	if err := ctx.Err(); err != nil {
@@ -164,4 +162,3 @@ func applyObfs(c net.Conn, mode, host, serverAddr string) net.Conn {
 	// simple-obfs will be implemented as a separate module.
 	return c
 }
-
