@@ -29,6 +29,12 @@ const (
 	nicID             = 1
 )
 
+var bufPool = sync.Pool{
+	New: func() any {
+		return make([]byte, relayBufferSize)
+	},
+}
+
 // Tunnel connects a TUN device to a Shadowsocks proxy using gVisor netstack.
 // It intercepts TCP/UDP packets from the TUN and relays them through the proxy.
 type Tunnel struct {
@@ -157,20 +163,19 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 	startTime := time.Now()
 	id := r.ID()
-	srcAddr := fmt.Sprintf("%s:%d", id.RemoteAddress.String(), id.RemotePort)
-	dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+	srcAddr := fmt.Sprintf("%s:%d", id.RemoteAddress, id.RemotePort)
+	dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress, id.LocalPort)
 
 	var wq waiter.Queue
 	ep, tcpErr := r.CreateEndpoint(&wq)
 	if tcpErr != nil {
-		log.Printf("[TCP] failed to create endpoint for %s: %v", dstAddr, tcpErr)
 		r.Complete(true)
 		return
 	}
 	r.Complete(false)
 
 	localConn := gonet.NewTCPConn(&wq, ep)
-	defer func() { _ = localConn.Close() }()
+	defer localConn.Close()
 
 	// Dial through SS proxy
 	ctx, cancel := context.WithTimeout(context.Background(), tcpConnectTimeout)
@@ -178,17 +183,16 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 
 	remoteConn, err := t.proxy.DialContext(ctx, dstAddr)
 	if err != nil {
-		log.Printf("[TCP] %s <-> %s: dial failed (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
+		log.Printf("[TCP] dial fail %s -> %s: %v", srcAddr, dstAddr, err)
 		return
 	}
-	defer func() { _ = remoteConn.Close() }()
-
-	log.Printf("[TCP] %s <-> %s (dial %v)", srcAddr, dstAddr, time.Since(startTime))
+	defer remoteConn.Close()
 
 	// Bidirectional relay
 	if err := pipe(localConn, remoteConn); err != nil {
-		log.Printf("[TCP] %s <-> %s: relay error (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
+		log.Printf("[TCP] relay %s <-> %s: %v", srcAddr, dstAddr, err)
 	}
+	_ = startTime
 }
 
 // relayUDP relays a UDP session through the SS proxy.
@@ -199,19 +203,18 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 	dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
 
 	localConn := gonet.NewUDPConn(wq, ep)
-	defer func() { _ = localConn.Close() }()
+	defer localConn.Close()
 
 	// Dial UDP through SS proxy
 	remotePC, err := t.proxy.DialUDP()
 	if err != nil {
-		log.Printf("[UDP] %s <-> %s: dial failed (setup %v): %v", srcAddr, dstAddr, time.Since(arriveTime), err)
+		log.Printf("[UDP] dial fail %s -> %s: %v", srcAddr, dstAddr, err)
 		return
 	}
-	defer func() { _ = remotePC.Close() }()
+	defer remotePC.Close()
 
 	remote, err := net.ResolveUDPAddr("udp", dstAddr)
 	if err != nil {
-		log.Printf("[UDP] resolve %s: %v", dstAddr, err)
 		return
 	}
 
@@ -235,13 +238,30 @@ func (t *Tunnel) Close() {
 // connection stays alive. Only when the source goes silent for the full
 // idle period does the Read return a timeout error.
 type idleReader struct {
-	conn    net.Conn
-	timeout time.Duration
+	conn        net.Conn
+	timeout     time.Duration
+	lastRefresh time.Time
 }
 
 func (r *idleReader) Read(p []byte) (int, error) {
-	_ = r.conn.SetReadDeadline(time.Now().Add(r.timeout))
+	now := time.Now()
+	if now.Sub(r.lastRefresh) > r.timeout/2 {
+		_ = r.conn.SetReadDeadline(now.Add(r.timeout))
+		r.lastRefresh = now
+	}
 	return r.conn.Read(p)
+}
+
+type timeoutWriter struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *timeoutWriter) Write(p []byte) (int, error) {
+	if c.timeout > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.timeout))
+	}
+	return c.Conn.Write(p)
 }
 
 type halfCloser interface {
@@ -251,7 +271,7 @@ type halfCloser interface {
 func enableKeepAlive(c net.Conn) {
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
 	}
 }
 
@@ -279,7 +299,9 @@ func pipe(a, b net.Conn) error {
 	copyFunc := func(dst, src net.Conn, name string) {
 		defer wg.Done()
 
-		buf := make([]byte, relayBufferSize)
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
+
 		reader := &idleReader{conn: src, timeout: tcpIdleTimeout}
 
 		_, err := io.CopyBuffer(dst, reader, buf)
@@ -287,13 +309,13 @@ func pipe(a, b net.Conn) error {
 		if err != nil && err != io.EOF {
 			errCh <- fmt.Errorf("%s copy error: %w", name, err)
 
-			// Жёстко закрываем обе стороны
+			// TcpIdletimout closing
 			_ = dst.Close()
 			_ = src.Close()
 			return
 		}
 
-		// Чистый EOF → half-close
+		// EOF → half-close
 		if tc, ok := dst.(halfCloser); ok {
 			_ = tc.CloseWrite()
 		}
