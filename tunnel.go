@@ -23,8 +23,8 @@ import (
 
 const (
 	tcpConnectTimeout = 2 * time.Second
-	tcpIdleTimeout    = 2 * time.Minute // close direction after this much inactivity
-	udpSessionTimeout = 2 * time.Minute
+	tcpIdleTimeout    = 60 * time.Second // close direction after this much inactivity
+	udpSessionTimeout = 60 * time.Minute
 	relayBufferSize   = 32 * 1024 // 32 KB per direction (matches io.Copy default)
 	nicID             = 1
 )
