@@ -188,6 +188,8 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	defer remoteConn.Close()
 
+	log.Printf("[TCP] %s <-> %s ", srcAddr, dstAddr)
+
 	// Bidirectional relay
 	if err := pipe(localConn, remoteConn); err != nil {
 		log.Printf("[TCP] relay %s <-> %s: %v", srcAddr, dstAddr, err)
