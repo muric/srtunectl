@@ -43,12 +43,25 @@ func NewSSProxy(addr, method, password, obfsMode, obfsHost string) (*SSProxy, er
 
 // DialContext establishes a TCP connection through the Shadowsocks server
 // to the given target address (host:port).
+// DialContext establishes a TCP connection through the Shadowsocks server
+// to the given target address (host:port).
 func (ss *SSProxy) DialContext(ctx context.Context, targetAddr string) (net.Conn, error) {
+	// fast check before start connect
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Connect to SS server
 	dialer := net.Dialer{Timeout: ssTCPConnectTimeout}
 	c, err := dialer.DialContext(ctx, "tcp", ss.addr)
 	if err != nil {
 		return nil, fmt.Errorf("connect to SS server %s: %w", ss.addr, err)
+	}
+
+	// check contex after connect
+	if err := ctx.Err(); err != nil {
+		_ = c.Close()
+		return nil, err
 	}
 
 	// Apply simple-obfs if configured
@@ -59,12 +72,19 @@ func (ss *SSProxy) DialContext(ctx context.Context, targetAddr string) (net.Conn
 	// Wrap connection with SS cipher
 	c = ss.cipher.StreamConn(c)
 
+	// check after write
+	if err := ctx.Err(); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+
 	// Write target address in SOCKS5 format (SS protocol standard)
 	tgt := socks.ParseAddr(targetAddr)
 	if tgt == nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("failed to parse target address: %s", targetAddr)
 	}
+
 	if _, err := c.Write(tgt); err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("failed to write target address: %w", err)
@@ -144,3 +164,4 @@ func applyObfs(c net.Conn, mode, host, serverAddr string) net.Conn {
 	// simple-obfs will be implemented as a separate module.
 	return c
 }
+
