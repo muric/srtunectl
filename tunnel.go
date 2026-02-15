@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	tcpConnectTimeout = 5 * time.Second
-	tcpIdleTimeout    = 5 * time.Minute // close direction after this much inactivity
+	tcpConnectTimeout = 2 * time.Second
+	tcpIdleTimeout    = 2 * time.Minute // close direction after this much inactivity
 	udpSessionTimeout = 2 * time.Minute
 	relayBufferSize   = 32 * 1024 // 32 KB per direction (matches io.Copy default)
 	nicID             = 1
@@ -244,6 +244,17 @@ func (r *idleReader) Read(p []byte) (int, error) {
 	return r.conn.Read(p)
 }
 
+type halfCloser interface {
+	CloseWrite() error
+}
+
+func enableKeepAlive(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+}
+
 // pipe copies data bidirectionally between two net.Conn and waits
 // for both directions to finish. Returns the first non-EOF error.
 //
@@ -265,42 +276,31 @@ func pipe(a, b net.Conn) error {
 
 	errCh := make(chan error, 2)
 
-	type halfCloser interface {
-		CloseWrite() error
-	}
-
 	copyFunc := func(dst, src net.Conn, name string) {
 		defer wg.Done()
+
 		buf := make([]byte, relayBufferSize)
 		reader := &idleReader{conn: src, timeout: tcpIdleTimeout}
+
 		_, err := io.CopyBuffer(dst, reader, buf)
+
 		if err != nil && err != io.EOF {
 			errCh <- fmt.Errorf("%s copy error: %w", name, err)
-			// Connection is broken (reset, network error, etc.).
-			// Close both sides immediately so the peer goroutine
-			// doesn't linger for tcpIdleTimeout on a dead connection.
+
+			// Жёстко закрываем обе стороны
 			_ = dst.Close()
 			_ = src.Close()
 			return
 		}
-		// Clean EOF: signal peer that this direction is done via
-		// half-close if supported. SS cipher wrappers don't implement
-		// CloseWrite — skip; the other goroutine's idleReader will
-		// time out when the remote stops sending.
+
+		// Чистый EOF → half-close
 		if tc, ok := dst.(halfCloser); ok {
 			_ = tc.CloseWrite()
 		}
 	}
 
-	// Enable TCP keep-alive for long-lived connections (best-effort)
-	if tc, ok := a.(*net.TCPConn); ok {
-		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(30 * time.Second)
-	}
-	if tc, ok := b.(*net.TCPConn); ok {
-		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(30 * time.Second)
-	}
+	enableKeepAlive(a)
+	enableKeepAlive(b)
 
 	go copyFunc(b, a, "a->b")
 	go copyFunc(a, b, "b->a")
@@ -308,6 +308,7 @@ func pipe(a, b net.Conn) error {
 	wg.Wait()
 	close(errCh)
 
+	// return error if exist
 	for e := range errCh {
 		if e != nil {
 			return e
@@ -358,5 +359,3 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration
 
 	wg.Wait()
 }
-
-
