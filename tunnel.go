@@ -456,12 +456,3 @@ func isTimeoutError(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
 }
-
-// ptr returns a pointer to the given value.
-func ptr[T any](v T) *T {
-	return &v
-}
-
-type halfCloser interface {
-	CloseWrite() error
-}
