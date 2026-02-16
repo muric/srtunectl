@@ -333,12 +333,12 @@ func copyFunc(dst, src net.Conn, desc string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	dstChan := make(chan []byte, 16)
 	srcChan := make(chan error, 1)
+	dstChan := make(chan []byte, 16)
 
 	go func() {
 		defer close(srcChan)
-		buffer := make([]byte, 4096)
+		buffer := make([]byte, 1<<14)
 		for {
 			n, err := src.Read(buffer)
 			if err != nil {
@@ -355,7 +355,7 @@ func copyFunc(dst, src net.Conn, desc string) {
 
 	go func() {
 		defer close(dstChan)
-		buffer := make([]byte, 4096)
+		buffer := make([]byte, 1<<14)
 		for {
 			_, err := dst.Write(buffer)
 			if err != nil {
