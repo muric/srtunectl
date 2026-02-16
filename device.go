@@ -5,8 +5,10 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -19,6 +21,18 @@ type TUNDevice struct {
 	fd   int
 	mtu  int
 	name string
+}
+
+var (
+	tunPacketsDispatched uint64
+	tunReadErrors        uint64
+	tunICMPReplies       uint64
+)
+
+func snapshotTUNStats() (packets, readErrors, icmpReplies uint64) {
+	return atomic.LoadUint64(&tunPacketsDispatched),
+		atomic.LoadUint64(&tunReadErrors),
+		atomic.LoadUint64(&tunICMPReplies)
 }
 
 // newTUNDeviceFromFile wraps an already-open TUN file descriptor as a TUNDevice.
@@ -152,8 +166,11 @@ func (e *TUNEndpoint) Close() {
 
 // dispatchLoop reads raw IP packets from the TUN device and delivers
 // them to the gVisor netstack for processing.
+// Uses poll() to wait for data instead of busy-looping on EAGAIN,
+// which previously consumed 100% CPU on one core.
 func (e *TUNEndpoint) dispatchLoop() {
 	buf := make([]byte, e.mtu+4) // extra room for safety
+	pollFds := []unix.PollFd{{Fd: int32(e.tunDev.fd), Events: unix.POLLIN}}
 
 	for {
 		select {
@@ -162,12 +179,27 @@ func (e *TUNEndpoint) dispatchLoop() {
 		default:
 		}
 
+		// Wait for data with 100ms timeout.
+		// Allows periodic done-channel checks without CPU spinning.
+		pn, pollErr := unix.Poll(pollFds, 100)
+		if pn <= 0 {
+			if pollErr != nil && pollErr != unix.EINTR {
+				select {
+				case <-e.done:
+					return
+				default:
+					continue
+				}
+			}
+			continue // timeout, check done channel
+		}
+
 		n, err := syscall.Read(e.tunDev.fd, buf)
 		if err != nil {
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-				// Non-blocking: no data available, try again
 				continue
 			}
+			atomic.AddUint64(&tunReadErrors, 1)
 			select {
 			case <-e.done:
 				return
@@ -200,6 +232,7 @@ func (e *TUNEndpoint) dispatchLoop() {
 		// This gives <1ms ping for TUN-routed IPs — a quick diagnostic
 		// that the route goes through the tunnel.
 		if e.handleICMPEcho(pktData, proto) {
+			atomic.AddUint64(&tunICMPReplies, 1)
 			continue
 		}
 
@@ -208,6 +241,7 @@ func (e *TUNEndpoint) dispatchLoop() {
 			Payload: buffer.MakeWithData(pktData),
 		})
 		e.dispatcher.DeliverNetworkPacket(proto, pkt)
+		atomic.AddUint64(&tunPacketsDispatched, 1)
 		pkt.DecRef()
 	}
 }

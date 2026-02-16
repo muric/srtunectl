@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/shadowsocks/go-shadowsocks2/core"
@@ -21,6 +22,7 @@ type SSProxy struct {
 	cipher   core.Cipher // AEAD cipher for encryption
 	obfsMode string      // "http", "tls", or "" (no obfuscation)
 	obfsHost string      // host to impersonate for obfuscation
+	udpPool  sync.Pool
 }
 
 // NewSSProxy creates a new Shadowsocks proxy.
@@ -38,17 +40,34 @@ func NewSSProxy(addr, method, password, obfsMode, obfsHost string) (*SSProxy, er
 		cipher:   cipher,
 		obfsMode: obfsMode,
 		obfsHost: obfsHost,
+		udpPool: sync.Pool{
+			New: func() any {
+				buf := make([]byte, 0, 65535)
+				return &buf
+			},
+		},
 	}, nil
 }
 
 // DialContext establishes a TCP connection through the Shadowsocks server
 // to the given target address (host:port).
 func (ss *SSProxy) DialContext(ctx context.Context, targetAddr string) (net.Conn, error) {
+	// fast check before start connect
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Connect to SS server
 	dialer := net.Dialer{Timeout: ssTCPConnectTimeout}
 	c, err := dialer.DialContext(ctx, "tcp", ss.addr)
 	if err != nil {
 		return nil, fmt.Errorf("connect to SS server %s: %w", ss.addr, err)
+	}
+
+	// check context after connect
+	if err := ctx.Err(); err != nil {
+		_ = c.Close()
+		return nil, err
 	}
 
 	// Apply simple-obfs if configured
@@ -59,12 +78,19 @@ func (ss *SSProxy) DialContext(ctx context.Context, targetAddr string) (net.Conn
 	// Wrap connection with SS cipher
 	c = ss.cipher.StreamConn(c)
 
+	// check before writing the target address
+	if err := ctx.Err(); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+
 	// Write target address in SOCKS5 format (SS protocol standard)
 	tgt := socks.ParseAddr(targetAddr)
 	if tgt == nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("failed to parse target address: %s", targetAddr)
 	}
+
 	if _, err := c.Write(tgt); err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("failed to write target address: %w", err)
@@ -79,6 +105,10 @@ func (ss *SSProxy) DialUDP() (net.PacketConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen UDP: %w", err)
 	}
+	if udpConn, ok := pc.(*net.UDPConn); ok {
+		_ = udpConn.SetReadBuffer(4 << 20)
+		_ = udpConn.SetWriteBuffer(4 << 20)
+	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", ss.addr)
 	if err != nil {
@@ -89,14 +119,19 @@ func (ss *SSProxy) DialUDP() (net.PacketConn, error) {
 	// Wrap with SS cipher
 	pc = ss.cipher.PacketConn(pc)
 
-	return &ssPacketConn{PacketConn: pc, rAddr: udpAddr}, nil
+	return &ssPacketConn{
+		PacketConn: pc,
+		rAddr:      udpAddr,
+		bufPool:    &ss.udpPool,
+	}, nil
 }
 
 // ssPacketConn wraps a PacketConn to always send to the SS server
 // with the target address prepended in SOCKS5 format.
 type ssPacketConn struct {
 	net.PacketConn
-	rAddr net.Addr
+	rAddr   net.Addr
+	bufPool *sync.Pool
 }
 
 func (pc *ssPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
@@ -105,12 +140,33 @@ func (pc *ssPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if tgt == nil {
 		return 0, fmt.Errorf("failed to parse target address: %s", addr)
 	}
+	return pc.WriteToTarget(b, tgt)
+}
 
-	buf := make([]byte, len(tgt)+len(b))
+// WriteToTarget writes a UDP payload to a pre-parsed SOCKS target address.
+// This avoids per-packet target parsing in hot paths.
+func (pc *ssPacketConn) WriteToTarget(b []byte, tgt socks.Addr) (int, error) {
+	needed := len(tgt) + len(b)
+
+	pBuf := pc.bufPool.Get().(*[]byte)
+	buf := *pBuf
+
+	if cap(buf) < needed {
+		buf = make([]byte, needed)
+	}
+	buf = buf[:needed]
 	copy(buf, tgt)
 	copy(buf[len(tgt):], b)
 
-	return pc.PacketConn.WriteTo(buf, pc.rAddr)
+	defer func() {
+		*pBuf = buf[:0]
+		pc.bufPool.Put(pBuf)
+	}()
+
+	if _, err := pc.PacketConn.WriteTo(buf, pc.rAddr); err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func (pc *ssPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
@@ -125,16 +181,11 @@ func (pc *ssPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		return 0, nil, fmt.Errorf("failed to parse SOCKS address from response")
 	}
 
-	// Resolve the SOCKS address to a UDP address
-	udpAddr, resolveErr := net.ResolveUDPAddr("udp", tgt.String())
-	if resolveErr != nil {
-		return 0, nil, fmt.Errorf("resolve response address: %w", resolveErr)
-	}
-
 	// Return data after the address header
 	addrLen := len(tgt)
 	copy(b, b[addrLen:n])
-	return n - addrLen, udpAddr, err
+	// Caller currently ignores addr; return server addr to avoid DNS work.
+	return n - addrLen, pc.rAddr, err
 }
 
 // applyObfs wraps a connection with simple-obfs (HTTP or TLS mode).
