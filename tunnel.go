@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/shadowsocks/go-shadowsocks2/socks"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -24,8 +27,10 @@ import (
 const (
 	tcpConnectTimeout = 2 * time.Second
 	tcpIdleTimeout    = 60 * time.Second // close direction after this much inactivity
-	udpSessionTimeout = 60 * time.Minute
+	tcpHalfCloseWait  = 75 * time.Second
+	udpSessionTimeout = 2 * time.Minute
 	relayBufferSize   = 32 * 1024 // 32 KB per direction (matches io.Copy default)
+	metricsLogPeriod  = 30 * time.Second
 	nicID             = 1
 )
 
@@ -34,13 +39,25 @@ var bufPool = sync.Pool{
 		return make([]byte, relayBufferSize)
 	},
 }
+var (
+	activeTCPRelays        int64
+	activeUDPRelays        int64
+	tcpRelayTimeouts       uint64
+	tcpRelayErrors         uint64
+	udpRelayTimeouts       uint64
+	udpRelayErrors         uint64
+	udpCreateEndpointError uint64
+)
 
 // Tunnel connects a TUN device to a Shadowsocks proxy using gVisor netstack.
 // It intercepts TCP/UDP packets from the TUN and relays them through the proxy.
 type Tunnel struct {
-	stack    *stack.Stack
-	proxy    *SSProxy
-	endpoint *TUNEndpoint
+	stack         *stack.Stack
+	proxy         *SSProxy
+	endpoint      *TUNEndpoint
+	telemetryStop chan struct{}
+	telemetryDone chan struct{}
+	closeOnce     sync.Once
 }
 
 // NewTunnel creates and starts a new tunnel.
@@ -90,9 +107,11 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
 
 	t := &Tunnel{
-		stack:    s,
-		proxy:    proxy,
-		endpoint: endpoint,
+		stack:         s,
+		proxy:         proxy,
+		endpoint:      endpoint,
+		telemetryStop: make(chan struct{}),
+		telemetryDone: make(chan struct{}),
 	}
 
 	// Set up TCP forwarder — handles all incoming TCP connections
@@ -110,6 +129,7 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
+			atomic.AddUint64(&udpCreateEndpointError, 1)
 			// Endpoint already exists — packet handled by existing session
 			return true
 		}
@@ -155,12 +175,17 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 		},
 	})
 
+	go t.telemetryLoop()
+
 	return t, nil
 }
 
 // handleTCP handles a new TCP connection from the netstack.
 // It dials the SS proxy and relays data bidirectionally.
 func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
+	atomic.AddInt64(&activeTCPRelays, 1)
+	defer atomic.AddInt64(&activeTCPRelays, -1)
+
 	startTime := time.Now()
 	id := r.ID()
 	srcAddr := fmt.Sprintf("%s:%d", id.RemoteAddress, id.RemotePort)
@@ -192,7 +217,13 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 
 	// Bidirectional relay
 	if err := pipe(localConn, remoteConn); err != nil {
-		log.Printf("[TCP] relay %s <-> %s: %v", srcAddr, dstAddr, err)
+		if isTimeoutError(err) {
+			atomic.AddUint64(&tcpRelayTimeouts, 1)
+			log.Printf("[TCP] %s <-> %s: relay timeout (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
+			return
+		}
+		atomic.AddUint64(&tcpRelayErrors, 1)
+		log.Printf("[TCP] %s <-> %s: relay error (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
 	}
 	_ = startTime
 }
@@ -201,6 +232,9 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 // The endpoint is already created and registered by the forwarder handler.
 // arriveTime is when the first packet hit the forwarder (before goroutine start).
 func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcpip.Endpoint, arriveTime time.Time) {
+	atomic.AddInt64(&activeUDPRelays, 1)
+	defer atomic.AddInt64(&activeUDPRelays, -1)
+
 	srcAddr := fmt.Sprintf("%s:%d", id.RemoteAddress.String(), id.RemotePort)
 	dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
 
@@ -219,20 +253,37 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 	if err != nil {
 		return
 	}
+	targetAddr := socks.ParseAddr(dstAddr)
+	if targetAddr == nil {
+		log.Printf("[UDP] failed to parse target addr: %s", dstAddr)
+		return
+	}
 
 	log.Printf("[UDP] %s <-> %s (setup %v)", srcAddr, dstAddr, time.Since(arriveTime))
 
 	// Bidirectional packet relay
-	pipePacket(localConn, remotePC, remote, udpSessionTimeout)
+	if err := pipePacket(localConn, remotePC, remote, targetAddr, udpSessionTimeout); err != nil {
+		if isTimeoutError(err) {
+			atomic.AddUint64(&udpRelayTimeouts, 1)
+			log.Printf("[UDP] %s <-> %s: relay timeout: %v", srcAddr, dstAddr, err)
+			return
+		}
+		atomic.AddUint64(&udpRelayErrors, 1)
+		log.Printf("[UDP] %s <-> %s: relay error: %v", srcAddr, dstAddr, err)
+	}
 }
 
 // Close shuts down the tunnel and releases resources.
 // Order: close stack first (drains connections), then endpoint (closes TUN fd).
 // stack.Wait() may call endpoint.Close() again — safe due to closeOnce.
 func (t *Tunnel) Close() {
-	t.stack.Close()
-	t.stack.Wait()
-	t.endpoint.Close()
+	t.closeOnce.Do(func() {
+		close(t.telemetryStop)
+		<-t.telemetryDone
+		t.stack.Close()
+		t.stack.Wait()
+		t.endpoint.Close()
+	})
 }
 
 // idleReader wraps a net.Conn and resets the read deadline before every
@@ -317,10 +368,14 @@ func pipe(a, b net.Conn) error {
 			_ = src.Close()
 			return
 		}
-
-		// EOF → half-close
+		// Clean EOF: signal peer that this direction is done via
+		// half-close if supported. SS cipher wrappers don't implement
+		// CloseWrite. In that case cap post-EOF wait to tcpHalfCloseWait
+		// to avoid keeping dead relay tails for full tcpIdleTimeout.
 		if tc, ok := dst.(halfCloser); ok {
 			_ = tc.CloseWrite()
+		} else {
+			_ = dst.SetReadDeadline(time.Now().Add(tcpHalfCloseWait))
 		}
 	}
 
@@ -343,9 +398,19 @@ func pipe(a, b net.Conn) error {
 }
 
 // pipePacket copies packets bidirectionally between two PacketConns.
-func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration) {
+// On any read/write error it closes both conns so the peer goroutine
+// exits immediately instead of lingering until timeout.
+func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr, timeout time.Duration) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
+	errCh := make(chan error, 2)
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			_ = local.Close()
+			_ = remote.Close()
+		})
+	}
 
 	// local -> remote
 	go func() {
@@ -355,12 +420,23 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration
 			_ = local.SetReadDeadline(time.Now().Add(timeout))
 			n, _, err := local.ReadFrom(buf)
 			if err != nil {
+				errCh <- fmt.Errorf("local->remote read: %w", err)
+				closeBoth()
 				return
+			}
+			if ssConn, ok := remote.(*ssPacketConn); ok {
+				if _, err := ssConn.WriteToTarget(buf[:n], targetAddr); err != nil {
+					errCh <- fmt.Errorf("local->remote write: %w", err)
+					closeBoth()
+					return
+				}
+				continue
 			}
 			if _, err := remote.WriteTo(buf[:n], to); err != nil {
+				errCh <- fmt.Errorf("local->remote write: %w", err)
+				closeBoth()
 				return
 			}
-			_ = remote.SetReadDeadline(time.Now().Add(timeout))
 		}
 	}()
 
@@ -372,15 +448,62 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, timeout time.Duration
 			_ = remote.SetReadDeadline(time.Now().Add(timeout))
 			n, _, err := remote.ReadFrom(buf)
 			if err != nil {
+				errCh <- fmt.Errorf("remote->local read: %w", err)
+				closeBoth()
 				return
 			}
 			// Write back to local (source is the TUN side)
 			if _, err := local.WriteTo(buf[:n], nil); err != nil {
+				errCh <- fmt.Errorf("remote->local write: %w", err)
+				closeBoth()
 				return
 			}
-			_ = local.SetReadDeadline(time.Now().Add(timeout))
 		}
 	}()
 
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *Tunnel) telemetryLoop() {
+	ticker := time.NewTicker(metricsLogPeriod)
+	defer func() {
+		ticker.Stop()
+		close(t.telemetryDone)
+	}()
+	for {
+		select {
+		case <-t.telemetryStop:
+			return
+		case <-ticker.C:
+			pkts, readErrs, icmpReplies := snapshotTUNStats()
+			log.Printf(
+				"[METRICS] active_tcp=%d active_udp=%d tcp_timeouts=%d tcp_errors=%d udp_timeouts=%d udp_errors=%d udp_create_endpoint_errors=%d tun_packets=%d tun_read_errors=%d icmp_replies=%d",
+				atomic.LoadInt64(&activeTCPRelays),
+				atomic.LoadInt64(&activeUDPRelays),
+				atomic.LoadUint64(&tcpRelayTimeouts),
+				atomic.LoadUint64(&tcpRelayErrors),
+				atomic.LoadUint64(&udpRelayTimeouts),
+				atomic.LoadUint64(&udpRelayErrors),
+				atomic.LoadUint64(&udpCreateEndpointError),
+				pkts,
+				readErrs,
+				icmpReplies,
+			)
+		}
+	}
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
