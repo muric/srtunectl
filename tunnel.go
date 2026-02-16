@@ -27,7 +27,7 @@ import (
 const (
 	tcpConnectTimeout = 60 * time.Second
 	tcpIdleTimeout    = 60 * time.Second // close direction after this much inactivity
-	tcpHalfCloseWait  = 75 * time.Second
+	tcpHalfCloseWait  = 40 * time.Second
 	udpSessionTimeout = 2 * time.Minute
 	relayBufferSize   = 32 * 1024 // 32 KB per direction (matches io.Copy default)
 	metricsLogPeriod  = 30 * time.Second
@@ -226,7 +226,6 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 		atomic.AddUint64(&tcpRelayErrors, 1)
 		log.Printf("[TCP] %s <-> %s: relay error (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
 	}
-	_ = startTime
 }
 
 // relayUDP relays a UDP session through the SS proxy.
@@ -291,7 +290,7 @@ type halfCloser interface {
 	CloseWrite() error
 }
 
-// set keepalive to tcp connetction
+// set keepalive to tcp connection
 func enableKeepAlive(c net.Conn) {
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
@@ -388,7 +387,7 @@ func pipe(a, b net.Conn) error {
 
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					log.Printf("pipe: idle timeout %s", dir)
-					continue
+					return
 				}
 
 				log.Printf("pipe: read error %s: %v", dir, err)

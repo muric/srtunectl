@@ -64,7 +64,7 @@ func (ss *SSProxy) DialContext(ctx context.Context, targetAddr string) (net.Conn
 		return nil, fmt.Errorf("connect to SS server %s: %w", ss.addr, err)
 	}
 
-	// check contex after connect
+	// check context after connect
 	if err := ctx.Err(); err != nil {
 		_ = c.Close()
 		return nil, err
@@ -78,7 +78,7 @@ func (ss *SSProxy) DialContext(ctx context.Context, targetAddr string) (net.Conn
 	// Wrap connection with SS cipher
 	c = ss.cipher.StreamConn(c)
 
-	// check after write
+	// check before writing the target address
 	if err := ctx.Err(); err != nil {
 		_ = c.Close()
 		return nil, err
