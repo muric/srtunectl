@@ -200,7 +200,7 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 	r.Complete(false)
 
 	localConn := gonet.NewTCPConn(&wq, ep)
-	defer localConn.Close()
+	defer func() { _ = localConn.Close() }()
 
 	// Dial through SS proxy
 	ctx, cancel := context.WithTimeout(context.Background(), tcpConnectTimeout)
@@ -211,7 +211,7 @@ func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
 		log.Printf("[TCP] dial fail %s -> %s: %v", srcAddr, dstAddr, err)
 		return
 	}
-	defer remoteConn.Close()
+	defer func() { _ = remoteConn.Close() }()
 
 	log.Printf("[TCP] %s <-> %s ", srcAddr, dstAddr)
 
@@ -239,7 +239,7 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 	dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
 
 	localConn := gonet.NewUDPConn(wq, ep)
-	defer localConn.Close()
+	defer func() { _ = localConn.Close() }()
 
 	// Dial UDP through SS proxy
 	remotePC, err := t.proxy.DialUDP()
@@ -247,7 +247,7 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 		log.Printf("[UDP] dial fail %s -> %s: %v", srcAddr, dstAddr, err)
 		return
 	}
-	defer remotePC.Close()
+	defer func() { _ = remotePC.Close() }()
 
 	remote, err := net.ResolveUDPAddr("udp", dstAddr)
 	if err != nil {
@@ -284,37 +284,6 @@ func (t *Tunnel) Close() {
 		t.stack.Wait()
 		t.endpoint.Close()
 	})
-}
-
-// idleReader wraps a net.Conn and resets the read deadline before every
-// Read call. As long as data keeps arriving within tcpIdleTimeout the
-// connection stays alive. Only when the source goes silent for the full
-// idle period does the Read return a timeout error.
-type idleReader struct {
-	conn        net.Conn
-	timeout     time.Duration
-	lastRefresh time.Time
-}
-
-func (r *idleReader) Read(p []byte) (int, error) {
-	now := time.Now()
-	if now.Sub(r.lastRefresh) > r.timeout/2 {
-		_ = r.conn.SetReadDeadline(now.Add(r.timeout))
-		r.lastRefresh = now
-	}
-	return r.conn.Read(p)
-}
-
-type timeoutWriter struct {
-	net.Conn
-	timeout time.Duration
-}
-
-func (c *timeoutWriter) Write(p []byte) (int, error) {
-	if c.timeout > 0 {
-		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.timeout))
-	}
-	return c.Conn.Write(p)
 }
 
 type halfCloser interface {

@@ -265,7 +265,7 @@ func runDaemonMode(config Config) {
 		stats.PrintStats()
 	}()
 
-	log.Println("Daemon running. Press Ctrl+C to stop.")
+	log.Println("Daemon running!!!")
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
