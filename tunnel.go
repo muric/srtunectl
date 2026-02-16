@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -191,49 +190,69 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 
 // handleTCP handles a new TCP connection from the netstack.
 // It dials the SS proxy and relays data bidirectionally.
-func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
-	atomic.AddInt64(&activeTCPRelays, 1)
-	defer atomic.AddInt64(&activeTCPRelays, -1)
-
-	startTime := time.Now()
-	id := r.ID()
-	srcAddr := fmt.Sprintf("%s:%d", id.RemoteAddress, id.RemotePort)
-	dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress, id.LocalPort)
-
-	var wq waiter.Queue
-	ep, tcpErr := r.CreateEndpoint(&wq)
-	if tcpErr != nil {
-		r.Complete(true)
-		return
+func pipe(local, remote net.Conn) error {
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			_ = local.Close()
+			_ = remote.Close()
+		})
 	}
-	r.Complete(false)
 
-	localConn := gonet.NewTCPConn(&wq, ep)
-	defer func() { _ = localConn.Close() }()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	errCh := make(chan error, 2)
 
-	// Dial through SS proxy
-	ctx, cancel := context.WithTimeout(context.Background(), tcpConnectTimeout)
-	defer cancel()
+	enableKeepAlive(remote)
 
-	remoteConn, err := t.proxy.DialContext(ctx, dstAddr)
-	if err != nil {
-		log.Printf("[TCP] dial fail %s -> %s: %v", srcAddr, dstAddr, err)
-		return
-	}
-	defer func() { _ = remoteConn.Close() }()
+	relay := func(dst, src net.Conn) {
+		defer wg.Done()
+		defer closeBoth()
 
-	log.Printf("[TCP] %s <-> %s ", srcAddr, dstAddr)
+		pBuf := bufPool.Get().(*[]byte)
+		buf := (*pBuf)[:cap(*pBuf)]
 
-	// Bidirectional relay
-	if err := pipe(localConn, remoteConn); err != nil {
-		if isTimeoutError(err) {
-			atomic.AddUint64(&tcpRelayTimeouts, 1)
-			log.Printf("[TCP] %s <-> %s: relay timeout (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
-			return
+		defer func() {
+			*pBuf = buf[:0]
+			bufPool.Put(pBuf)
+		}()
+
+		for {
+			_ = src.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
+			n, err := src.Read(buf)
+
+			if n > 0 {
+				_ = dst.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					errCh <- werr
+					return
+				}
+			}
+
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					if hc, ok := dst.(interface{ CloseWrite() error }); ok {
+						_ = hc.CloseWrite()
+					}
+					return
+				}
+				if !isTimeoutError(err) && !errors.Is(err, net.ErrClosed) {
+					errCh <- err
+				}
+				return
+			}
 		}
-		atomic.AddUint64(&tcpRelayErrors, 1)
-		log.Printf("[TCP] %s <-> %s: relay error (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
 	}
+
+	go relay(remote, local)
+	go relay(local, remote)
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		return err
+	}
+	return nil
 }
 
 // relayUDP relays a UDP session through the SS proxy.
@@ -252,32 +271,21 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 	// Dial UDP through SS proxy
 	remotePC, err := t.proxy.DialUDP()
 	if err != nil {
+		atomic.AddUint64(&udpRelayErrors, 1)
 		log.Printf("[UDP] dial fail %s -> %s: %v", srcAddr, dstAddr, err)
 		return
 	}
 	defer func() { _ = remotePC.Close() }()
 
-	remote, err := net.ResolveUDPAddr("udp", dstAddr)
-	if err != nil {
-		return
-	}
 	targetAddr := socks.ParseAddr(dstAddr)
-	if targetAddr == nil {
-		log.Printf("[UDP] failed to parse target addr: %s", dstAddr)
-		return
-	}
 
-	log.Printf("[UDP] %s <-> %s (setup %v)", srcAddr, dstAddr, time.Since(arriveTime))
-
-	// Bidirectional packet relay
-	if err := pipePacket(localConn, remotePC, remote, targetAddr, udpSessionTimeout); err != nil {
+	if err := pipePacket(localConn, remotePC, nil, targetAddr, udpSessionTimeout); err != nil {
 		if isTimeoutError(err) {
 			atomic.AddUint64(&udpRelayTimeouts, 1)
-			log.Printf("[UDP] %s <-> %s: relay timeout: %v", srcAddr, dstAddr, err)
-			return
+		} else {
+			atomic.AddUint64(&udpRelayErrors, 1)
+			log.Printf("[UDP] %s <-> %s: relay error: %v", srcAddr, dstAddr, err)
 		}
-		atomic.AddUint64(&udpRelayErrors, 1)
-		log.Printf("[UDP] %s <-> %s: relay error: %v", srcAddr, dstAddr, err)
 	}
 }
 
@@ -322,85 +330,54 @@ func enableKeepAlive(c net.Conn) {
 // Both connections are closed by the caller (handleTCP defers)
 // after pipe returns.
 func pipe(a, b net.Conn) error {
-	log.Printf("pipe: open %s <-> %s", a.RemoteAddr(), b.RemoteAddr())
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer func() {
-		log.Printf("pipe: context cancel %s <-> %s", a.RemoteAddr(), b.RemoteAddr())
-		cancel()
-	}()
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			a.Close()
+			b.Close()
+		})
+	}
+	defer closeBoth()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-
 	errCh := make(chan error, 2)
-
-	enableKeepAlive(a)
-	enableKeepAlive(b)
 
 	relay := func(dst, src net.Conn) {
 		defer wg.Done()
+		defer closeBoth()
 
 		pBuf := bufPool.Get().(*[]byte)
-		buf := *pBuf
+
+		buf := (*pBuf)[:cap(*pBuf)]
 
 		defer func() {
 			*pBuf = buf[:0]
 			bufPool.Put(pBuf)
 		}()
 
-		dir := src.RemoteAddr().String() + " -> " + dst.RemoteAddr().String()
-		log.Printf("pipe: start relay %s", dir)
-
 		for {
-			select {
-			case <-ctx.Done():
-				log.Printf("pipe: ctx canceled relay %s", dir)
-				return
-			default:
-			}
-
 			_ = src.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
-
-			n, err := src.Read(buf[:cap(buf)])
+			n, err := src.Read(buf)
 
 			if n > 0 {
 				_ = dst.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
 				if _, werr := dst.Write(buf[:n]); werr != nil {
-					if errors.Is(werr, context.Canceled) {
-						log.Printf("pipe: write canceled %s", dir)
-						return
-					}
-					log.Printf("pipe: write error %s: %v", dir, werr)
 					errCh <- werr
-					cancel()
 					return
 				}
 			}
 
 			if err != nil {
 				if errors.Is(err, io.EOF) {
-					log.Printf("pipe: EOF %s (half-close)", dir)
-					// half-close
-					if hc, ok := dst.(halfCloser); ok {
+					if hc, ok := dst.(interface{ CloseWrite() error }); ok {
 						_ = hc.CloseWrite()
 					}
 					return
 				}
-
-				if errors.Is(err, context.Canceled) {
-					log.Printf("pipe: read canceled %s", dir)
-					return
+				if !isTimeoutError(err) {
+					errCh <- err
 				}
-
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					log.Printf("pipe: idle timeout %s", dir)
-					return
-				}
-
-				log.Printf("pipe: read error %s: %v", dir, err)
-				errCh <- err
-				cancel()
 				return
 			}
 		}
@@ -413,13 +390,10 @@ func pipe(a, b net.Conn) error {
 	close(errCh)
 
 	for err := range errCh {
-		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("pipe: final error %v", err)
+		if err != nil {
 			return err
 		}
 	}
-
-	log.Printf("pipe: closed %s <-> %s", a.RemoteAddr(), b.RemoteAddr())
 	return nil
 }
 
@@ -430,8 +404,8 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 	var wg sync.WaitGroup
 	wg.Add(2)
 	errCh := make(chan error, 2)
-	var closeOnce sync.Once
 
+	var closeOnce sync.Once
 	closeBoth := func() {
 		closeOnce.Do(func() {
 			_ = local.Close()
@@ -439,10 +413,12 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 		})
 	}
 
-	// local -> remote
-	go func() {
+	relay := func(dst, src net.PacketConn, isLocal bool) {
 		defer wg.Done()
+		defer closeBoth()
+
 		pBuf := udpBufPool.Get().(*[]byte)
+
 		defer func() {
 			*pBuf = (*pBuf)[:0]
 			udpBufPool.Put(pBuf)
@@ -451,62 +427,40 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 		for {
 			buf := (*pBuf)[:cap(*pBuf)]
 
-			_ = local.SetReadDeadline(time.Now().Add(timeout))
-			n, _, err := local.ReadFrom(buf)
-			if err != nil {
-				if !errors.Is(err, io.EOF) && !isTimeoutError(err) {
-					errCh <- fmt.Errorf("local->remote read: %w", err)
-				}
-				closeBoth()
-				return
-			}
+			_ = src.SetReadDeadline(time.Now().Add(timeout))
+			n, _, err := src.ReadFrom(buf)
 
-			if ssConn, ok := remote.(*ssPacketConn); ok {
-				if _, err := ssConn.WriteToTarget(buf[:n], targetAddr); err != nil {
-					errCh <- fmt.Errorf("local->remote write: %w", err)
-					closeBoth()
+			if n > 0 {
+				var werr error
+				if isLocal { // local (TUN) -> remote (SS)
+					if ssConn, ok := remote.(*ssPacketConn); ok {
+						_, werr = ssConn.WriteToTarget(buf[:n], targetAddr)
+					} else {
+						_, werr = remote.WriteTo(buf[:n], to)
+					}
+				} else {
+					_, werr = local.WriteTo(buf[:n], nil)
+				}
+
+				if werr != nil {
+					if !isTimeoutError(werr) {
+						errCh <- fmt.Errorf("write error: %w", werr)
+					}
 					return
 				}
-				continue
 			}
 
-			if _, err := remote.WriteTo(buf[:n], to); err != nil {
-				errCh <- fmt.Errorf("local->remote write: %w", err)
-				closeBoth()
-				return
-			}
-		}
-	}()
-
-	// remote -> local
-	go func() {
-		defer wg.Done()
-		pBuf := udpBufPool.Get().(*[]byte)
-		defer func() {
-			*pBuf = (*pBuf)[:0]
-			udpBufPool.Put(pBuf)
-		}()
-
-		for {
-			buf := (*pBuf)[:cap(*pBuf)]
-
-			_ = remote.SetReadDeadline(time.Now().Add(timeout))
-			n, _, err := remote.ReadFrom(buf)
 			if err != nil {
-				if !errors.Is(err, io.EOF) && !isTimeoutError(err) {
-					errCh <- fmt.Errorf("remote->local read: %w", err)
+				if !isTimeoutError(err) && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+					errCh <- fmt.Errorf("read error: %w", err)
 				}
-				closeBoth()
-				return
-			}
-
-			if _, err := local.WriteTo(buf[:n], nil); err != nil {
-				errCh <- fmt.Errorf("remote->local write: %w", err)
-				closeBoth()
 				return
 			}
 		}
-	}()
+	}
+
+	go relay(remote, local, true)
+	go relay(local, remote, false)
 
 	wg.Wait()
 	close(errCh)
