@@ -36,7 +36,8 @@ const (
 
 var bufPool = sync.Pool{
 	New: func() any {
-		return make([]byte, relayBufferSize)
+		buf := make([]byte, relayBufferSize)
+		return &buf
 	},
 }
 var (
