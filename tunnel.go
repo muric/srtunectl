@@ -344,8 +344,15 @@ func enableKeepAlive(c net.Conn) {
 //
 // Both connections are closed by the caller (handleTCP defers)
 // after pipe returns.
-
 func pipe(a, b net.Conn) error {
+	log.Printf("pipe: open %s <-> %s", a.RemoteAddr(), b.RemoteAddr())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		log.Printf("pipe: context cancel %s <-> %s", a.RemoteAddr(), b.RemoteAddr())
+		cancel()
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -354,61 +361,82 @@ func pipe(a, b net.Conn) error {
 	enableKeepAlive(a)
 	enableKeepAlive(b)
 
-	// direction a -> b
-	go func() {
+	relay := func(dst, src net.Conn) {
 		defer wg.Done()
 
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
 
-		reader := &idleReader{conn: a, timeout: tcpIdleTimeout}
+		dir := src.RemoteAddr().String() + " -> " + dst.RemoteAddr().String()
+		log.Printf("pipe: start relay %s", dir)
 
-		_, err := io.CopyBuffer(b, reader, buf)
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("pipe: ctx canceled relay %s", dir)
+				return
+			default:
+			}
 
-		if err != nil && !errors.Is(err, io.EOF) {
-			errCh <- err
-			return
+			_ = src.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
+			n, err := src.Read(buf)
+
+			if n > 0 {
+				_ = dst.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					if errors.Is(werr, context.Canceled) {
+						log.Printf("pipe: write canceled %s", dir)
+						return
+					}
+					log.Printf("pipe: write error %s: %v", dir, werr)
+					errCh <- werr
+					cancel()
+					return
+				}
+			}
+
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					log.Printf("pipe: EOF %s (half-close)", dir)
+					// half-close
+					if hc, ok := dst.(halfCloser); ok {
+						_ = hc.CloseWrite()
+					}
+					return
+				}
+
+				if errors.Is(err, context.Canceled) {
+					log.Printf("pipe: read canceled %s", dir)
+					return
+				}
+
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					log.Printf("pipe: idle timeout %s", dir)
+					continue
+				}
+
+				log.Printf("pipe: read error %s: %v", dir, err)
+				errCh <- err
+				cancel()
+				return
+			}
 		}
+	}
 
-		// half-close
-		if hc, ok := b.(halfCloser); ok {
-			_ = hc.CloseWrite()
-		} else {
-			_ = b.SetReadDeadline(time.Now().Add(tcpHalfCloseWait))
-		}
-	}()
-
-	// direction b -> a
-	go func() {
-		defer wg.Done()
-
-		buf := bufPool.Get().([]byte)
-		defer bufPool.Put(buf)
-
-		reader := &idleReader{conn: b, timeout: tcpIdleTimeout}
-
-		_, err := io.CopyBuffer(a, reader, buf)
-
-		if err != nil && !errors.Is(err, io.EOF) {
-			errCh <- err
-			return
-		}
-
-		if hc, ok := a.(halfCloser); ok {
-			_ = hc.CloseWrite()
-		} else {
-			_ = a.SetReadDeadline(time.Now().Add(tcpHalfCloseWait))
-		}
-	}()
+	go relay(b, a)
+	go relay(a, b)
 
 	wg.Wait()
 	close(errCh)
 
 	for err := range errCh {
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("pipe: final error %v", err)
 			return err
 		}
 	}
+
+	log.Printf("pipe: closed %s <-> %s", a.RemoteAddr(), b.RemoteAddr())
 	return nil
 }
 
