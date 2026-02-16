@@ -245,6 +245,21 @@ func runDaemonMode(config Config) {
 	}
 
 	stats := NewStats()
+
+	if config.Interface != "" && config.Gateway != "" {
+		log.Println("Adding routes for interface:", config.Interface)
+		if err := addRoutesFromDir(mainRouteDir, config.Gateway, config.Interface, config.GoroutineCount, config.Debug, stats); err != nil {
+			log.Printf("\033[31mError adding routes: %v\033[0m\n", err)
+		}
+	}
+
+	if config.DefaultInterface != "" && config.DefaultGateway != "" {
+		log.Println("Adding routes for default interface:", config.DefaultInterface)
+		if err := addRoutesFromDir(defaultRouteDir, config.DefaultGateway, config.DefaultInterface, config.GoroutineCount, config.Debug, stats); err != nil {
+			log.Printf("\033[31mError adding default routes: %v\033[0m\n", err)
+		}
+	}
+
 	defer func() {
 		stats.Close()
 		stats.PrintStats()
