@@ -270,10 +270,11 @@ type halfCloser interface {
 	CloseWrite() error
 }
 
+// set keepalive to tcp connetction
 func enableKeepAlive(c net.Conn) {
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+		_ = tc.SetKeepAlivePeriod(10 * time.Second)
 	}
 }
 
