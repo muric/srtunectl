@@ -354,7 +354,8 @@ func pipe(a, b net.Conn) error {
 			}
 
 			_ = src.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
-			n, err := src.Read(buf)
+
+			n, err := src.Read(buf[:cap(buf)])
 
 			if n > 0 {
 				_ = dst.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
@@ -433,7 +434,12 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 	// local -> remote
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 65535)
+		pBuf := bufPool.Get().(*[]byte)
+		buf := *pBuf
+		defer func() {
+			*pBuf = buf[:0]
+			bufPool.Put(pBuf)
+		}()
 		for {
 			_ = local.SetReadDeadline(time.Now().Add(timeout))
 			n, _, err := local.ReadFrom(buf)
