@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -29,9 +30,9 @@ const (
 	tcpHalfCloseWait  = 40 * time.Second
 	udpSessionTimeout = 2 * time.Minute
 	relayBufferSize   = 32 * 1024 // 32 KB per direction (matches io.Copy default)
+	udpBufferSize     = 64 * 1024 // 64 KB for UDP (max IP packet size)
 	metricsLogPeriod  = 30 * time.Second
 	nicID             = 1
-	udpBufferSize     = 64 * 1024 // 64 KB for UDP (max IP packet size)
 )
 
 var bufPool = sync.Pool{
@@ -47,6 +48,7 @@ var udpBufPool = sync.Pool{
 		return &buf
 	},
 }
+
 var (
 	activeTCPRelays        int64
 	activeUDPRelays        int64
@@ -190,69 +192,49 @@ func NewTunnel(proxy *SSProxy, endpoint *TUNEndpoint) (*Tunnel, error) {
 
 // handleTCP handles a new TCP connection from the netstack.
 // It dials the SS proxy and relays data bidirectionally.
-func pipe(local, remote net.Conn) error {
-	var closeOnce sync.Once
-	closeBoth := func() {
-		closeOnce.Do(func() {
-			_ = local.Close()
-			_ = remote.Close()
-		})
+func (t *Tunnel) handleTCP(r *tcp.ForwarderRequest) {
+	atomic.AddInt64(&activeTCPRelays, 1)
+	defer atomic.AddInt64(&activeTCPRelays, -1)
+
+	startTime := time.Now()
+	id := r.ID()
+	srcAddr := fmt.Sprintf("%s:%d", id.RemoteAddress, id.RemotePort)
+	dstAddr := fmt.Sprintf("%s:%d", id.LocalAddress, id.LocalPort)
+
+	var wq waiter.Queue
+	ep, tcpErr := r.CreateEndpoint(&wq)
+	if tcpErr != nil {
+		r.Complete(true)
+		return
 	}
+	r.Complete(false)
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	errCh := make(chan error, 2)
+	localConn := gonet.NewTCPConn(&wq, ep)
+	defer func() { _ = localConn.Close() }()
 
-	enableKeepAlive(remote)
+	// Dial through SS proxy
+	ctx, cancel := context.WithTimeout(context.Background(), tcpConnectTimeout)
+	defer cancel()
 
-	relay := func(dst, src net.Conn) {
-		defer wg.Done()
-		defer closeBoth()
+	remoteConn, err := t.proxy.DialContext(ctx, dstAddr)
+	if err != nil {
+		log.Printf("[TCP] dial fail %s -> %s: %v", srcAddr, dstAddr, err)
+		return
+	}
+	defer func() { _ = remoteConn.Close() }()
 
-		pBuf := bufPool.Get().(*[]byte)
-		buf := (*pBuf)[:cap(*pBuf)]
+	log.Printf("[TCP] %s <-> %s ", srcAddr, dstAddr)
 
-		defer func() {
-			*pBuf = buf[:0]
-			bufPool.Put(pBuf)
-		}()
-
-		for {
-			_ = src.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
-			n, err := src.Read(buf)
-
-			if n > 0 {
-				_ = dst.SetWriteDeadline(time.Now().Add(tcpIdleTimeout))
-				if _, werr := dst.Write(buf[:n]); werr != nil {
-					errCh <- werr
-					return
-				}
-			}
-
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					if hc, ok := dst.(interface{ CloseWrite() error }); ok {
-						_ = hc.CloseWrite()
-					}
-					return
-				}
-				if !isTimeoutError(err) && !errors.Is(err, net.ErrClosed) {
-					errCh <- err
-				}
-				return
-			}
+	// Bidirectional relay
+	if err := pipe(localConn, remoteConn); err != nil {
+		if isTimeoutError(err) {
+			atomic.AddUint64(&tcpRelayTimeouts, 1)
+			log.Printf("[TCP] %s <-> %s: relay timeout (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
+			return
 		}
+		atomic.AddUint64(&tcpRelayErrors, 1)
+		log.Printf("[TCP] %s <-> %s: relay error (after %v): %v", srcAddr, dstAddr, time.Since(startTime), err)
 	}
-
-	go relay(remote, local)
-	go relay(local, remote)
-
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		return err
-	}
-	return nil
 }
 
 // relayUDP relays a UDP session through the SS proxy.
@@ -289,52 +271,14 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 	}
 }
 
-// Close shuts down the tunnel and releases resources.
-// Order: close stack first (drains connections), then endpoint (closes TUN fd).
-// stack.Wait() may call endpoint.Close() again — safe due to closeOnce.
-func (t *Tunnel) Close() {
-	t.closeOnce.Do(func() {
-		close(t.telemetryStop)
-		<-t.telemetryDone
-		t.stack.Close()
-		t.stack.Wait()
-		t.endpoint.Close()
-	})
-}
-
-type halfCloser interface {
-	CloseWrite() error
-}
-
-// set keepalive to tcp connection
-func enableKeepAlive(c net.Conn) {
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(10 * time.Second)
-	}
-}
-
-// pipe copies data bidirectionally between two net.Conn and waits
-// for both directions to finish. Returns the first non-EOF error.
-//
-// Each direction uses idleReader: read deadline is reset before every
-// Read, so a connection stays open as long as data flows. When one
-// direction finishes (client done sending), the other keeps running
-// until the remote side closes or goes idle for tcpIdleTimeout.
-//
-// If the connection supports half-close (CloseWrite), a TCP FIN is
-// sent to signal the peer. SS cipher wrappers don't support it —
-// that's fine, the idle timeout handles cleanup without killing
-// the reverse direction.
-//
-// Both connections are closed by the caller (handleTCP defers)
-// after pipe returns.
+// pipe copies data bidirectionally between two connections.
+// It handles TCP half-close (FIN) properly and enforces idle timeouts.
 func pipe(a, b net.Conn) error {
 	var closeOnce sync.Once
 	closeBoth := func() {
 		closeOnce.Do(func() {
-			a.Close()
-			b.Close()
+			_ = a.Close()
+			_ = b.Close()
 		})
 	}
 	defer closeBoth()
@@ -348,7 +292,7 @@ func pipe(a, b net.Conn) error {
 		defer closeBoth()
 
 		pBuf := bufPool.Get().(*[]byte)
-
+		// Ensure we use full capacity even if slice was put back as len 0
 		buf := (*pBuf)[:cap(*pBuf)]
 
 		defer func() {
@@ -370,12 +314,13 @@ func pipe(a, b net.Conn) error {
 
 			if err != nil {
 				if errors.Is(err, io.EOF) {
+					// half-close
 					if hc, ok := dst.(interface{ CloseWrite() error }); ok {
 						_ = hc.CloseWrite()
 					}
 					return
 				}
-				if !isTimeoutError(err) {
+				if !isTimeoutError(err) && !errors.Is(err, net.ErrClosed) {
 					errCh <- err
 				}
 				return
@@ -418,13 +363,13 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 		defer closeBoth()
 
 		pBuf := udpBufPool.Get().(*[]byte)
-
 		defer func() {
 			*pBuf = (*pBuf)[:0]
 			udpBufPool.Put(pBuf)
 		}()
 
 		for {
+			// Reslice to full capacity to avoid truncation (64KB)
 			buf := (*pBuf)[:cap(*pBuf)]
 
 			_ = src.SetReadDeadline(time.Now().Add(timeout))
@@ -438,7 +383,7 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 					} else {
 						_, werr = remote.WriteTo(buf[:n], to)
 					}
-				} else {
+				} else { // remote (SS) -> local (TUN)
 					_, werr = local.WriteTo(buf[:n], nil)
 				}
 
@@ -473,39 +418,50 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 	return nil
 }
 
+// Close shuts down the tunnel and the netstack.
+func (t *Tunnel) Close() {
+	t.closeOnce.Do(func() {
+		close(t.telemetryStop)
+		<-t.telemetryDone
+		t.stack.Close()
+		t.stack.Wait()
+		if t.endpoint != nil {
+			t.endpoint.Close()
+		}
+	})
+}
+
+// telemetryLoop logs tunnel statistics periodically.
 func (t *Tunnel) telemetryLoop() {
+	defer close(t.telemetryDone)
 	ticker := time.NewTicker(metricsLogPeriod)
-	defer func() {
-		ticker.Stop()
-		close(t.telemetryDone)
-	}()
+	defer ticker.Stop()
 	for {
 		select {
 		case <-t.telemetryStop:
 			return
 		case <-ticker.C:
-			pkts, readErrs, icmpReplies := snapshotTUNStats()
-			log.Printf(
-				"[METRICS] active_tcp=%d active_udp=%d tcp_timeouts=%d tcp_errors=%d udp_timeouts=%d udp_errors=%d udp_create_endpoint_errors=%d tun_packets=%d tun_read_errors=%d icmp_replies=%d",
-				atomic.LoadInt64(&activeTCPRelays),
-				atomic.LoadInt64(&activeUDPRelays),
-				atomic.LoadUint64(&tcpRelayTimeouts),
-				atomic.LoadUint64(&tcpRelayErrors),
-				atomic.LoadUint64(&udpRelayTimeouts),
-				atomic.LoadUint64(&udpRelayErrors),
-				atomic.LoadUint64(&udpCreateEndpointError),
-				pkts,
-				readErrs,
-				icmpReplies,
-			)
+			log.Printf("[Stats] TCP: %d, UDP: %d | Errs: TCP:%d, UDP:%d",
+				atomic.LoadInt64(&activeTCPRelays), atomic.LoadInt64(&activeUDPRelays),
+				atomic.LoadUint64(&tcpRelayErrors), atomic.LoadUint64(&udpRelayErrors))
 		}
 	}
 }
 
+// isTimeoutError returns true if the error is a network timeout.
 func isTimeoutError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// ptr returns a pointer to the given value.
+func ptr[T any](v T) *T {
+	return &v
+}
+
+type halfCloser interface {
+	CloseWrite() error
 }
