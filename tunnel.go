@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -329,67 +329,6 @@ func enableKeepAlive(c net.Conn) {
 	}
 }
 
-func copyFunc(dst, src net.Conn, desc string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	srcChan := make(chan error, 1)
-	dstChan := make(chan []byte, 16)
-
-	go func() {
-		defer close(srcChan)
-		buffer := make([]byte, 1<<14)
-		for {
-			n, err := src.Read(buffer)
-			if err != nil {
-				srcChan <- err
-				return
-			}
-			select {
-			case dstChan <- buffer[:n]:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	go func() {
-		defer close(dstChan)
-		buffer := make([]byte, 1<<14)
-		for {
-			_, err := dst.Write(buffer)
-			if err != nil {
-				srcChan <- err
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-		}
-	}()
-
-	for {
-		select {
-		case data, ok := <-dstChan:
-			if !ok {
-				return
-			}
-			_, err := dst.Write(data)
-			if err != nil {
-				srcChan <- err
-				return
-			}
-		case err := <-srcChan:
-			log.Printf("%s copy error: %v", desc, err)
-			_ = dst.Close()
-			_ = src.Close()
-			return
-		}
-	}
-}
-
 // pipe copies data bidirectionally between two net.Conn and waits
 // for both directions to finish. Returns the first non-EOF error.
 //
@@ -405,109 +344,72 @@ func copyFunc(dst, src net.Conn, desc string) {
 //
 // Both connections are closed by the caller (handleTCP defers)
 // after pipe returns.
-/*
+
 func pipe(a, b net.Conn) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	errCh := make(chan error, 2)
 
-	copyFunc := func(dst, src net.Conn, name string) {
+	enableKeepAlive(a)
+	enableKeepAlive(b)
+
+	// direction a -> b
+	go func() {
 		defer wg.Done()
 
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
 
-		reader := &idleReader{conn: src, timeout: tcpIdleTimeout}
+		reader := &idleReader{conn: a, timeout: tcpIdleTimeout}
 
-		_, err := io.CopyBuffer(dst, reader, buf)
+		_, err := io.CopyBuffer(b, reader, buf)
 
-		if err != nil && err != io.EOF {
-			errCh <- fmt.Errorf("%s copy error: %w", name, err)
-
-			// TcpIdletimout closing
-			_ = dst.Close()
-			_ = src.Close()
+		if err != nil && !errors.Is(err, io.EOF) {
+			errCh <- err
 			return
 		}
-		// Clean EOF: signal peer that this direction is done via
-		// half-close if supported. SS cipher wrappers don't implement
-		// CloseWrite. In that case cap post-EOF wait to tcpHalfCloseWait
-		// to avoid keeping dead relay tails for full tcpIdleTimeout.
-		if tc, ok := dst.(halfCloser); ok {
-			_ = tc.CloseWrite()
+
+		// half-close
+		if hc, ok := b.(halfCloser); ok {
+			_ = hc.CloseWrite()
 		} else {
-			_ = dst.SetReadDeadline(time.Now().Add(tcpHalfCloseWait))
+			_ = b.SetReadDeadline(time.Now().Add(tcpHalfCloseWait))
 		}
-	}
+	}()
 
-	enableKeepAlive(a)
-	enableKeepAlive(b)
+	// direction b -> a
+	go func() {
+		defer wg.Done()
 
-	go copyFunc(b, a, "a->b")
-	go copyFunc(a, b, "b->a")
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
+
+		reader := &idleReader{conn: b, timeout: tcpIdleTimeout}
+
+		_, err := io.CopyBuffer(a, reader, buf)
+
+		if err != nil && !errors.Is(err, io.EOF) {
+			errCh <- err
+			return
+		}
+
+		if hc, ok := a.(halfCloser); ok {
+			_ = hc.CloseWrite()
+		} else {
+			_ = a.SetReadDeadline(time.Now().Add(tcpHalfCloseWait))
+		}
+	}()
 
 	wg.Wait()
 	close(errCh)
 
-	// return error if exist
-	for e := range errCh {
-		if e != nil {
-			return e
+	for err := range errCh {
+		if err != nil {
+			return err
 		}
 	}
 	return nil
-}*/
-func pipe(a, b net.Conn) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	srcChan := make(chan []byte, 16)
-	dstChan := make(chan error, 2)
-
-	go func() {
-		buffer := make([]byte, 4096)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			n, err := a.Read(buffer)
-			if err != nil && !strings.Contains(err.Error(), "EOF") {
-				dstChan <- err
-				return
-			}
-			select {
-			case srcChan <- buffer[:n]:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	go func() {
-		for data := range srcChan {
-			_, err := b.Write(data)
-			if err != nil && !strings.Contains(err.Error(), "EOF") {
-				dstChan <- err
-				return
-			}
-		}
-	}()
-
-	select {
-	case err := <-dstChan:
-		if err == context.DeadlineExceeded {
-			log.Println("Pipe operation timed out")
-		} else {
-			log.Printf("Pipe error: %v", err)
-		}
-		return err
-	case <-ctx.Done():
-		log.Println("Pipe operation cancelled")
-		return ctx.Err()
-	}
 }
 
 // pipePacket copies packets bidirectionally between two PacketConns.

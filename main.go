@@ -61,6 +61,7 @@ func readConfig(filename string) (Config, error) {
 		ObfsMode:       "disable",
 		SSMethod:       "aes-256-gcm",
 	}
+
 	scanner := bufio.NewScanner(file)
 
 	for scanner.Scan() {
@@ -77,7 +78,6 @@ func readConfig(filename string) (Config, error) {
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
 
-		// Skip empty values — keep defaults
 		if value == "" {
 			continue
 		}
@@ -163,17 +163,9 @@ func runOneshotMode(config Config) {
 	}
 
 	stats := NewStats()
-	defer stats.Close()
-
-	// Graceful shutdown handler
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		log.Println("\nReceived interrupt signal, shutting down...")
+	defer func() {
 		stats.Close()
 		stats.PrintStats()
-		os.Exit(0)
 	}()
 
 	if config.Interface != "" && config.Gateway != "" {
@@ -189,15 +181,11 @@ func runOneshotMode(config Config) {
 			log.Printf("\033[31mError adding default routes: %v\033[0m\n", err)
 		}
 	}
-
-	stats.Close()
-	stats.PrintStats()
 }
 
 // runDaemonMode creates a non-persistent TUN, starts SS client, adds routes,
 // and blocks until SIGINT/SIGTERM. TUN is auto-destroyed on process exit.
 func runDaemonMode(config Config) {
-	// Validate SS config
 	if config.SSServer == "" || config.SSServerPort == 0 || config.SSPassword == "" {
 		log.Fatalf("\033[31mShadowsocks is enabled but ss_server, ss_server_port, or ss_password is not set\033[0m")
 	}
@@ -213,17 +201,14 @@ func runDaemonMode(config Config) {
 		log.Fatalf("System error setting IP: %v", err)
 	}
 
-	// Determine SS server address
 	ssAddr := fmt.Sprintf("%s:%d", config.SSServer, config.SSServerPort)
 	var pluginCmd *PluginProcess
 
-	// Start obfuscation plugin if configured
 	switch config.ObfsMode {
 	case "v2ray":
 		if config.SSPlugin == "" {
 			log.Fatalf("\033[31mobfs_mode=v2ray but ss_plugin is not set\033[0m")
 		}
-		log.Printf("Starting V2Ray plugin: %s", config.SSPlugin)
 		p, err := startPlugin(config.SSPlugin, config.SSPluginOpts,
 			config.SSServer, config.SSServerPort)
 		if err != nil {
@@ -231,29 +216,23 @@ func runDaemonMode(config Config) {
 		}
 		ssAddr = p.localAddr
 		pluginCmd = p
-		log.Printf("Plugin started, SS traffic routed through %s", ssAddr)
 	case "simple-obfs":
 		log.Printf("Using simple-obfs with host: %s", config.ObfsHost)
 	case "disable", "":
-		log.Println("No obfuscation configured")
 	default:
-		log.Fatalf("\033[31mUnknown obfs_mode: %s (expected: disable, simple-obfs, v2ray)\033[0m", config.ObfsMode)
+		log.Fatalf("\033[31mUnknown obfs_mode: %s\033[0m", config.ObfsMode)
 	}
 
-	// Resolve obfs mode for the proxy
 	obfsForProxy := ""
 	if config.ObfsMode == "simple-obfs" {
 		obfsForProxy = "http"
 	}
 
-	// Create SS proxy
 	proxy, err := NewSSProxy(ssAddr, config.SSMethod, config.SSPassword, obfsForProxy, config.ObfsHost)
 	if err != nil {
 		log.Fatalf("\033[31mFailed to create SS proxy: %v\033[0m", err)
 	}
-	log.Printf("SS proxy created: %s (method=%s)", ssAddr, config.SSMethod)
 
-	// Wrap the open TUN fd as a device for netstack I/O
 	tunDev, err := newTUNDeviceFromFile(tunFile, config.Interface)
 	if err != nil {
 		log.Fatalf("\033[31mFailed to initialize TUN device: %v\033[0m", err)
@@ -264,64 +243,34 @@ func runDaemonMode(config Config) {
 	if err != nil {
 		log.Fatalf("\033[31mFailed to create tunnel: %v\033[0m", err)
 	}
-	log.Println("Tunnel started, processing packets")
 
-	// Add routes
 	stats := NewStats()
-	defer stats.Close()
+	defer func() {
+		stats.Close()
+		stats.PrintStats()
+	}()
 
-	if config.Interface != "" && config.Gateway != "" {
-		log.Println("Adding routes for interface:", config.Interface)
-		if err := addRoutesFromDir(mainRouteDir, config.Gateway, config.Interface, config.GoroutineCount, config.Debug, stats); err != nil {
-			log.Printf("\033[31mError adding routes: %v\033[0m\n", err)
-		}
-	}
-
-	if config.DefaultInterface != "" && config.DefaultGateway != "" {
-		log.Println("Adding routes for default interface:", config.DefaultInterface)
-		if err := addRoutesFromDir(defaultRouteDir, config.DefaultGateway, config.DefaultInterface, config.GoroutineCount, config.Debug, stats); err != nil {
-			log.Printf("\033[31mError adding default routes: %v\033[0m\n", err)
-		}
-	}
-
-	stats.Close()
-	stats.PrintStats()
-
-	// Block until signal
 	log.Println("Daemon running. Press Ctrl+C to stop.")
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
+
 	tunnel.Close()
 	if pluginCmd != nil {
 		stopPlugin(pluginCmd)
 	}
 }
 
-func signalHandler() {
-	sigChan := make(chan os.Signal, 2)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		log.Println("\nReceived interrupt signal, shutting down...")
-		os.Exit(0)
-	}()
-}
-
 func main() {
-	signalHandler()
 	config, err := readConfig("srtunectl.conf")
 	if err != nil {
 		log.Fatalf("\033[31mError reading configuration: %v\033[0m", err)
 	}
 
 	if !config.SSEnabled {
-		// Oneshot mode: create persistent TUN, add routes, exit.
 		runOneshotMode(config)
 		return
 	}
 
-	// Daemon mode: SS client enabled.
 	runDaemonMode(config)
 }
