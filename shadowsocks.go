@@ -144,14 +144,21 @@ func (pc *ssPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 // This avoids per-packet target parsing in hot paths.
 func (pc *ssPacketConn) WriteToTarget(b []byte, tgt socks.Addr) (int, error) {
 	needed := len(tgt) + len(b)
-	buf := pc.bufPool.Get().([]byte)
+
+	pBuf := pc.bufPool.Get().(*[]byte)
+	buf := *pBuf
+
 	if cap(buf) < needed {
 		buf = make([]byte, needed)
 	}
 	buf = buf[:needed]
 	copy(buf, tgt)
 	copy(buf[len(tgt):], b)
-	defer pc.bufPool.Put(buf[:0])
+
+	defer func() {
+		*pBuf = buf[:0]
+		pc.bufPool.Put(pBuf)
+	}()
 
 	if _, err := pc.PacketConn.WriteTo(buf, pc.rAddr); err != nil {
 		return 0, err
