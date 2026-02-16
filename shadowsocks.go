@@ -41,7 +41,10 @@ func NewSSProxy(addr, method, password, obfsMode, obfsHost string) (*SSProxy, er
 		obfsMode: obfsMode,
 		obfsHost: obfsHost,
 		udpPool: sync.Pool{
-			New: func() any { return make([]byte, 0, 65535) },
+			New: func() any {
+				buf := make([]byte, 0, 65535)
+				return &buf
+			},
 		},
 	}, nil
 }
