@@ -333,8 +333,13 @@ func pipe(a, b net.Conn) error {
 	relay := func(dst, src net.Conn) {
 		defer wg.Done()
 
-		buf := bufPool.Get().([]byte)
-		defer bufPool.Put(buf[:0])
+		pBuf := bufPool.Get().(*[]byte)
+		buf := *pBuf
+
+		defer func() {
+			*pBuf = buf[:0]
+			bufPool.Put(pBuf)
+		}()
 
 		dir := src.RemoteAddr().String() + " -> " + dst.RemoteAddr().String()
 		log.Printf("pipe: start relay %s", dir)
