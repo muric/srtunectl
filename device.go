@@ -29,12 +29,6 @@ var (
 	tunICMPReplies       uint64
 )
 
-func snapshotTUNStats() (packets, readErrors, icmpReplies uint64) {
-	return atomic.LoadUint64(&tunPacketsDispatched),
-		atomic.LoadUint64(&tunReadErrors),
-		atomic.LoadUint64(&tunICMPReplies)
-}
-
 // newTUNDeviceFromFile wraps an already-open TUN file descriptor as a TUNDevice.
 // The file must have been obtained from createTunInterface (non-persistent mode).
 func newTUNDeviceFromFile(file *os.File, ifName string) (*TUNDevice, error) {
@@ -405,4 +399,3 @@ func icmpv6Checksum(srcIP, dstIP, icmpData []byte) uint16 {
 	}
 	return ^uint16(sum)
 }
-
