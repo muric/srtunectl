@@ -308,7 +308,17 @@ func runDaemonMode(config Config) {
 	log.Println("Daemon running. Press Ctrl+C to stop.")
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	go func() {
+		<-sigChan
+		log.Println("\nReceived interrupt signal, shutting down...")
+		tunnel.Close()
+		if pluginCmd != nil {
+			stopPlugin(pluginCmd)
+		}
+		stats.Close()
+		stats.PrintStats()
+		os.Exit(0)
+	}()
 
 	log.Println("\nReceived interrupt signal, shutting down...")
 	tunnel.Close()
