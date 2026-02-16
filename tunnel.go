@@ -32,11 +32,19 @@ const (
 	relayBufferSize   = 32 * 1024 // 32 KB per direction (matches io.Copy default)
 	metricsLogPeriod  = 30 * time.Second
 	nicID             = 1
+	udpBufferSize     = 64 * 1024 // 64 KB for UDP (max IP packet size)
 )
 
 var bufPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, relayBufferSize)
+		return &buf
+	},
+}
+
+var udpBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, udpBufferSize)
 		return &buf
 	},
 }
@@ -423,6 +431,7 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 	wg.Add(2)
 	errCh := make(chan error, 2)
 	var closeOnce sync.Once
+
 	closeBoth := func() {
 		closeOnce.Do(func() {
 			_ = local.Close()
@@ -433,20 +442,25 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 	// local -> remote
 	go func() {
 		defer wg.Done()
-		pBuf := bufPool.Get().(*[]byte)
-		buf := *pBuf
+		pBuf := udpBufPool.Get().(*[]byte)
 		defer func() {
-			*pBuf = buf[:0]
-			bufPool.Put(pBuf)
+			*pBuf = (*pBuf)[:0]
+			udpBufPool.Put(pBuf)
 		}()
+
 		for {
+			buf := (*pBuf)[:cap(*pBuf)]
+
 			_ = local.SetReadDeadline(time.Now().Add(timeout))
 			n, _, err := local.ReadFrom(buf)
 			if err != nil {
-				errCh <- fmt.Errorf("local->remote read: %w", err)
+				if !errors.Is(err, io.EOF) && !isTimeoutError(err) {
+					errCh <- fmt.Errorf("local->remote read: %w", err)
+				}
 				closeBoth()
 				return
 			}
+
 			if ssConn, ok := remote.(*ssPacketConn); ok {
 				if _, err := ssConn.WriteToTarget(buf[:n], targetAddr); err != nil {
 					errCh <- fmt.Errorf("local->remote write: %w", err)
@@ -455,6 +469,7 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 				}
 				continue
 			}
+
 			if _, err := remote.WriteTo(buf[:n], to); err != nil {
 				errCh <- fmt.Errorf("local->remote write: %w", err)
 				closeBoth()
@@ -466,16 +481,25 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 	// remote -> local
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 65535)
+		pBuf := udpBufPool.Get().(*[]byte)
+		defer func() {
+			*pBuf = (*pBuf)[:0]
+			udpBufPool.Put(pBuf)
+		}()
+
 		for {
+			buf := (*pBuf)[:cap(*pBuf)]
+
 			_ = remote.SetReadDeadline(time.Now().Add(timeout))
 			n, _, err := remote.ReadFrom(buf)
 			if err != nil {
-				errCh <- fmt.Errorf("remote->local read: %w", err)
+				if !errors.Is(err, io.EOF) && !isTimeoutError(err) {
+					errCh <- fmt.Errorf("remote->local read: %w", err)
+				}
 				closeBoth()
 				return
 			}
-			// Write back to local (source is the TUN side)
+
 			if _, err := local.WriteTo(buf[:n], nil); err != nil {
 				errCh <- fmt.Errorf("remote->local write: %w", err)
 				closeBoth()
@@ -486,6 +510,7 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 
 	wg.Wait()
 	close(errCh)
+
 	for err := range errCh {
 		if err != nil {
 			return err
