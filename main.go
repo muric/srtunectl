@@ -292,14 +292,10 @@ func runDaemonMode(config Config) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
-
-	log.Println("\nReceived interrupt signal, shutting down...")
 	tunnel.Close()
 	if pluginCmd != nil {
 		stopPlugin(pluginCmd)
 	}
-	// TUN is non-persistent — it will be destroyed automatically when fd is closed
-	log.Println("Shutdown complete")
 }
 
 func signalHandler() {
@@ -308,6 +304,7 @@ func signalHandler() {
 
 	go func() {
 		<-sigChan
+		log.Println("\nReceived interrupt signal, shutting down...")
 		os.Exit(0)
 	}()
 }
