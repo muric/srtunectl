@@ -15,7 +15,7 @@ const (
 	defaultGoroutineCount = 4
 	defaultDebug          = false
 	defaultMTU            = 1500
-	defaultSSMTU          = 1400
+	defaultSSMTU          = 1500
 )
 
 type Config struct {
@@ -147,23 +147,6 @@ func readConfig(filename string) (Config, error) {
 	}
 
 	return config, nil
-}
-
-func main() {
-	config, err := readConfig("srtunectl.conf")
-	if err != nil {
-		log.Fatalf("\033[31mError reading configuration: %v\033[0m", err)
-	}
-	log.Printf("Config loaded: ss_enabled=%t mtu=%d", config.SSEnabled, config.MTU)
-
-	if !config.SSEnabled {
-		// Oneshot mode: create persistent TUN, add routes, exit.
-		runOneshotMode(config)
-		return
-	}
-
-	// Daemon mode: SS client enabled.
-	runDaemonMode(config)
 }
 
 // runOneshotMode creates a persistent TUN interface, adds routes and exits.
@@ -308,17 +291,7 @@ func runDaemonMode(config Config) {
 	log.Println("Daemon running. Press Ctrl+C to stop.")
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		log.Println("\nReceived interrupt signal, shutting down...")
-		tunnel.Close()
-		if pluginCmd != nil {
-			stopPlugin(pluginCmd)
-		}
-		stats.Close()
-		stats.PrintStats()
-		os.Exit(0)
-	}()
+	<-sigChan
 
 	log.Println("\nReceived interrupt signal, shutting down...")
 	tunnel.Close()
@@ -327,4 +300,31 @@ func runDaemonMode(config Config) {
 	}
 	// TUN is non-persistent — it will be destroyed automatically when fd is closed
 	log.Println("Shutdown complete")
+}
+
+func signalHandler() {
+	sigChan := make(chan os.Signal, 2)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		os.Exit(0)
+	}()
+}
+
+func main() {
+	signalHandler()
+	config, err := readConfig("srtunectl.conf")
+	if err != nil {
+		log.Fatalf("\033[31mError reading configuration: %v\033[0m", err)
+	}
+
+	if !config.SSEnabled {
+		// Oneshot mode: create persistent TUN, add routes, exit.
+		runOneshotMode(config)
+		return
+	}
+
+	// Daemon mode: SS client enabled.
+	runDaemonMode(config)
 }
