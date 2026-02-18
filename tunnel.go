@@ -364,27 +364,33 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 
 		pBuf := udpBufPool.Get().(*[]byte)
 		defer func() {
-			*pBuf = (*pBuf)[:0]
+			// Явно обнуляем перед возвратом
+			for i := range *pBuf {
+				(*pBuf)[i] = 0
+			}
 			udpBufPool.Put(pBuf)
 		}()
 
 		for {
-			// Reslice to full capacity to avoid truncation (64KB)
+			// Создаём свежий слайс от начала буфера
 			buf := (*pBuf)[:cap(*pBuf)]
 
 			_ = src.SetReadDeadline(time.Now().Add(timeout))
 			n, _, err := src.ReadFrom(buf)
 
 			if n > 0 {
+				// ИСПРАВЛЕНИЕ: используем ТОЛЬКО прочитанные байты
+				data := buf[:n] // ← Вот здесь была ошибка в оригинале?
+
 				var werr error
-				if isLocal { // local (TUN) -> remote (SS)
+				if isLocal {
 					if ssConn, ok := remote.(*ssPacketConn); ok {
-						_, werr = ssConn.WriteToTarget(buf[:n], targetAddr)
+						_, werr = ssConn.WriteToTarget(data, targetAddr)
 					} else {
-						_, werr = remote.WriteTo(buf[:n], to)
+						_, werr = remote.WriteTo(data, to)
 					}
-				} else { // remote (SS) -> local (TUN)
-					_, werr = local.WriteTo(buf[:n], nil)
+				} else {
+					_, werr = local.WriteTo(data, nil)
 				}
 
 				if werr != nil {
