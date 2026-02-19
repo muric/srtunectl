@@ -364,7 +364,7 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 
 		pBuf := udpBufPool.Get().(*[]byte)
 		defer func() {
-			// Явно обнуляем перед возвратом
+			// clear before returning
 			for i := range *pBuf {
 				(*pBuf)[i] = 0
 			}
@@ -372,15 +372,15 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 		}()
 
 		for {
-			// Создаём свежий слайс от начала буфера
+			// create new slice from begining
 			buf := (*pBuf)[:cap(*pBuf)]
 
 			_ = src.SetReadDeadline(time.Now().Add(timeout))
 			n, _, err := src.ReadFrom(buf)
 
 			if n > 0 {
-				// ИСПРАВЛЕНИЕ: используем ТОЛЬКО прочитанные байты
-				data := buf[:n] // ← Вот здесь была ошибка в оригинале?
+				// read only readed bytes
+				data := buf[:n]
 
 				var werr error
 				if isLocal {
