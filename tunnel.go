@@ -259,6 +259,8 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 	}
 	defer func() { _ = remotePC.Close() }()
 
+	log.Printf("[UDP] %s <-> %s ", srcAddr, dstAddr)
+
 	targetAddr := socks.ParseAddr(dstAddr)
 
 	if err := pipePacket(localConn, remotePC, targetAddr, udpSessionTimeout); err != nil {
