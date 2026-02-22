@@ -261,7 +261,7 @@ func (t *Tunnel) relayUDP(id stack.TransportEndpointID, wq *waiter.Queue, ep tcp
 
 	targetAddr := socks.ParseAddr(dstAddr)
 
-	if err := pipePacket(localConn, remotePC, nil, targetAddr, udpSessionTimeout); err != nil {
+	if err := pipePacket(localConn, remotePC, targetAddr, udpSessionTimeout); err != nil {
 		if isTimeoutError(err) {
 			atomic.AddUint64(&udpRelayTimeouts, 1)
 		} else {
@@ -345,7 +345,7 @@ func pipe(a, b net.Conn) error {
 // pipePacket copies packets bidirectionally between two PacketConns.
 // On any read/write error it closes both conns so the peer goroutine
 // exits immediately instead of lingering until timeout.
-func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr, timeout time.Duration) error {
+func pipePacket(localConn, remoteConn net.PacketConn, targetAddr socks.Addr, timeout time.Duration) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	errCh := make(chan error, 2)
@@ -353,44 +353,41 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 	var closeOnce sync.Once
 	closeBoth := func() {
 		closeOnce.Do(func() {
-			_ = local.Close()
-			_ = remote.Close()
+			_ = localConn.Close()
+			_ = remoteConn.Close()
 		})
 	}
 
-	relay := func(dst, src net.PacketConn, isLocal bool) {
+	relayPacket := func(dst net.PacketConn, src net.PacketConn) {
 		defer wg.Done()
 		defer closeBoth()
 
 		pBuf := udpBufPool.Get().(*[]byte)
 		defer func() {
-			// clear before returning
 			for i := range *pBuf {
 				(*pBuf)[i] = 0
 			}
 			udpBufPool.Put(pBuf)
 		}()
 
-		for {
-			// create new slice from begining
-			buf := (*pBuf)[:cap(*pBuf)]
+		buf := (*pBuf)[:cap(*pBuf)]
 
+		for {
 			_ = src.SetReadDeadline(time.Now().Add(timeout))
 			n, _, err := src.ReadFrom(buf)
 
 			if n > 0 {
-				// read only readed bytes
 				data := buf[:n]
 
 				var werr error
-				if isLocal {
-					if ssConn, ok := remote.(*ssPacketConn); ok {
+				if dst == remoteConn {
+					if ssConn, ok := remoteConn.(*ssPacketConn); ok {
 						_, werr = ssConn.WriteToTarget(data, targetAddr)
 					} else {
-						_, werr = remote.WriteTo(data, to)
+						_, werr = remoteConn.WriteTo(data, nil)
 					}
 				} else {
-					_, werr = local.WriteTo(data, nil)
+					_, werr = localConn.WriteTo(data, nil)
 				}
 
 				if werr != nil {
@@ -410,8 +407,8 @@ func pipePacket(local, remote net.PacketConn, to net.Addr, targetAddr socks.Addr
 		}
 	}
 
-	go relay(remote, local, true)
-	go relay(local, remote, false)
+	go relayPacket(remoteConn, localConn)
+	go relayPacket(localConn, remoteConn)
 
 	wg.Wait()
 	close(errCh)
